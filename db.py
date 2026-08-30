@@ -264,12 +264,26 @@ def get_meta(k, default=None):
     return row["v"] if row else default
 
 
+# Allowed flag fields — keep in sync with app.ALLOWED_FLAG_FIELDS
+_ALLOWED_FLAGS = {"starred", "hidden"}
+
 def set_flag(key, field, value):
-    assert field in ("starred", "hidden")
+    """Update a flag column safely. Returns number of rows updated (0 if key not found).
+
+    Raises ValueError if field is not in allowlist — never interpolate unchecked
+    input into SQL (assert is stripped with -O).
+    """
+    if field not in _ALLOWED_FLAGS:
+        raise ValueError(f"field must be one of {sorted(_ALLOWED_FLAGS)}")
+    if not isinstance(value, int) or value not in (0, 1):
+        raise ValueError("value must be 0 or 1")
     conn = get_conn()
-    conn.execute(f"UPDATE listings SET {field}=? WHERE key=?", (int(value), key))
+    # field is allowlisted above, so interpolation is safe; value/key are bound params
+    cur = conn.execute(f"UPDATE listings SET {field}=? WHERE key=?", (int(value), key))
+    n = cur.rowcount
     conn.commit()
     conn.close()
+    return n
 
 
 def fetch_listings():

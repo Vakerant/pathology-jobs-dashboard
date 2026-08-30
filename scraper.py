@@ -8,7 +8,8 @@ hide expired notices. Each source is isolated in try/except.
 """
 import re
 import sys
-import warnings
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, date
 from urllib.parse import urljoin
@@ -21,7 +22,10 @@ from bs4 import BeautifulSoup
 import db
 from sources import SOURCES, RECRUIT_KEYWORDS, PATHOLOGY_KEYWORDS, STOPWORDS, JUNK_TITLES
 
-warnings.filterwarnings("ignore")
+log = logging.getLogger("scraper")
+# Only suppress InsecureRequestWarning if insecure hosts are explicitly allowed
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -32,6 +36,17 @@ HEADERS = {
 TIMEOUT = (10, 30)          # (connect, read) — govt sites are slow but do answer
 MAX_ITEMS_PER_SOURCE = 60
 MAX_WORKERS = 10
+
+# Hosts that genuinely need verify=False (broken cert chain). Default empty — secure by default.
+# Override via env: PATHO_INSECURE_HOSTS="host1,host2"
+_INSECURE_HOSTS = {h.strip().lower() for h in os.environ.get("PATHO_INSECURE_HOSTS", "").split(",") if h.strip()}
+
+def _is_insecure_host(url: str) -> bool:
+    try:
+        host = url.split("/")[2].lower().split(":")[0]
+    except Exception:
+        return False
+    return host in _INSECURE_HOSTS or any(host.endswith("." + h) or host == h for h in _INSECURE_HOSTS)
 
 
 def _session():
@@ -231,7 +246,10 @@ def scrape_source(src, session=None):
     new_count = 0
     sess = session or _session()
     try:
-        resp = sess.get(src["url"], timeout=TIMEOUT, verify=False)
+        verify = False if _is_insecure_host(src["url"]) else True
+        if not verify:
+            log.warning("TLS verification disabled for %s (allowlisted via PATHO_INSECURE_HOSTS)", src["url"])
+        resp = sess.get(src["url"], timeout=TIMEOUT, verify=verify)
         http = resp.status_code
         if http >= 400:
             db.record_status(src["id"], src["name"], src["region"], "failed", http, 0, f"HTTP {http}")
