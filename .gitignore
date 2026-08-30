@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+data.db
+scrape.log
+email_config.json
+.vercel
+public/.vercel
+data.db-shm
+data.db-wal
+public/data.json
+public/index.html
+server.log
+*.bak
+*.bak-pre-fix
+data.db.bak-pre-fix
