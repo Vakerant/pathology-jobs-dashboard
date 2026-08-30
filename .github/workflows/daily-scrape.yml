@@ -1,0 +1,64 @@
+name: Daily pathology scrape
+
+on:
+  schedule:
+    # 08:00 IST = 02:30 UTC daily
+    - cron: "30 2 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore cached DB (if any)
+        uses: actions/cache@v4
+        with:
+          path: data.db
+          key: pathology-db-${{ hashFiles('sources.py') }}
+          restore-keys: |
+            pathology-db-
+
+      - name: Seed + scrape + build static
+        run: |
+          python seed.py
+          python scraper.py
+          python export_static.py
+          ls -lh public/data.json || echo "no data.json"
+          echo "listings=$(python -c 'import json;print(len(json.load(open(\"public/data.json\"))[\"listings\"]))')" >> $GITHUB_ENV
+
+      - name: Commit updated static mirror
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # public/data.json is gitignored locally but we force-add the fresh build
+          git add -f public/data.json public/index.html 2>/dev/null || git add -f public/data.json
+          # keep DB in cache, not in git; but save a tiny meta for next run
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          git commit -m "chore: daily scrape ${{ env.listings }} listings [skip ci]"
+          git push
+
+      - name: Summary
+        run: |
+          echo "✅ Scraped ${{ env.listings }} listings — public/data.json updated"
+          echo "Vercel will auto-deploy if connected to this repo."
