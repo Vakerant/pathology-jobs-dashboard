@@ -42,7 +42,8 @@ jobs:
           python scraper.py
           python export_static.py
           ls -lh public/data.json || echo "no data.json"
-          echo "listings=$(python -c 'import json;print(len(json.load(open(\"public/data.json\"))[\"listings\"]))')" >> $GITHUB_ENV
+          python_count=$(python -c "import json; print(len(json.load(open('public/data.json'))['listings']))")
+          echo "listings=$python_count" >> $GITHUB_ENV
 
       - name: Commit updated static mirror
         run: |
