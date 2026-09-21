@@ -5,12 +5,16 @@ import re
 import hashlib
 from datetime import datetime, timezone, timedelta, date
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db")
+import config
+
+# Single source of truth for the DB path + prune/stale policy lives in config.py
+# (env-overridable). ``config.DB_PATH`` already falls back to <project>/data.db.
+DB_PATH = str(config.DB_PATH)
 
 # Days a listing may stay unseen on its source page before we drop it.
-PRUNE_UNSEEN_DAYS = 45
+PRUNE_UNSEEN_DAYS = config.PRUNE_UNSEEN_DAYS
 # A notice whose only date is a publish/"uploaded on" date goes stale after this.
-STALE_NOTICE_DAYS = 45
+STALE_NOTICE_DAYS = config.STALE_NOTICE_DAYS
 
 
 def get_conn():
@@ -73,6 +77,25 @@ def init_db():
     conn.commit()
     conn.close()
     _migrate_keys_v2()
+    _apply_schema_migrations()
+
+
+def _apply_schema_migrations():
+    """Apply any pending versioned schema migrations (see migrations.py).
+    Imported lazily to avoid a circular import (migrations imports db).
+
+    Backs up first when there is real work to do, so the auto-migration on
+    boot never mutates the production DB without a recovery point."""
+    import migrations
+
+    conn = get_conn()
+    try:
+        pending = [m for m in migrations.MIGRATIONS if m[0] > migrations.get_schema_version(conn)]
+        if pending:
+            migrations.backup()
+        migrations.apply_pending(conn)
+    finally:
+        conn.close()
 
 
 def norm_title(title):
@@ -166,12 +189,14 @@ def upsert_listing(item):
         c.execute(
             """INSERT INTO listings
                (key, source_id, source_name, region, category, title, url,
-                relevance, snippet, is_seed, notice_date, deadline, first_seen, last_seen)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                relevance, snippet, is_seed, notice_date, deadline,
+                document_type, first_seen, last_seen)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (key, item["source_id"], item["source_name"], item["region"],
              item["category"], title, item["url"], item["relevance"],
              item.get("snippet", ""), int(item.get("is_seed", 0)),
-             item.get("notice_date"), item.get("deadline"), now, now),
+             item.get("notice_date"), item.get("deadline"),
+             item.get("document_type", "UNKNOWN"), now, now),
         )
     else:
         # keep an existing notice_date/deadline if the new scrape didn't find one
@@ -179,10 +204,13 @@ def upsert_listing(item):
             """UPDATE listings SET last_seen=?, relevance=?, snippet=?,
                source_name=?, region=?, category=?,
                notice_date=COALESCE(?, notice_date),
-               deadline=COALESCE(?, deadline) WHERE key=?""",
+               deadline=COALESCE(?, deadline),
+               document_type=CASE WHEN ? = 'UNKNOWN' THEN document_type ELSE ? END
+               WHERE key=?""",
             (now, item["relevance"], item.get("snippet", ""), item["source_name"],
              item["region"], item["category"], item.get("notice_date"),
-             item.get("deadline"), key),
+             item.get("deadline"), item.get("document_type", "UNKNOWN"),
+             item.get("document_type", "UNKNOWN"), key),
         )
     conn.commit()
     conn.close()
@@ -230,6 +258,7 @@ def enrich(listings):
             l["is_new"] = (nd or dl) >= new_cut
         else:
             l["is_new"] = bool(l["first_seen"] >= seen_cut and not l["is_seed"])
+    return listings
 
 
 def record_status(source_id, source_name, region, status, http_status, items_found, error=""):

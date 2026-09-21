@@ -14,3 +14,16 @@ server.log
 *.bak
 *.bak-pre-fix
 data.db.bak-pre-fix
+
+# secrets / local config — never commit
+.env
+email_config.json
+backups/
+
+# stray DB artifacts from the wrong DB name (live DB is data.db)
+database.db
+database.db-shm
+database.db-wal
+
+# local agent logs
+.opencode/eoc.log

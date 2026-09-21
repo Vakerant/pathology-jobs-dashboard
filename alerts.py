@@ -5,14 +5,15 @@ Runs after each scrape. Finds high-relevance (clearly-pathology) listings that
 haven't been emailed yet, sends a single grouped HTML digest, then marks them
 sent so you never get a duplicate.
 
-Credentials live in `email_config.json` (NOT in code, NOT in git). Template:
+Credentials come from environment variables (see `.env.example`) or, as a local
+fallback, `email_config.json` (NOT in code, NOT in git). Template:
 
     {
       "smtp_host": "smtp.gmail.com",
       "smtp_port": 465,
-      "sender":    "vbhvverma7@gmail.com",
+      "sender":    "you@example.com",
       "app_password": "xxxx xxxx xxxx xxxx",   <-- Gmail App Password (16 chars)
-      "recipients": ["vbhvverma7@gmail.com"]
+      "recipients": ["you@example.com"]
     }
 
 Get a Gmail App Password:  Google Account -> Security -> 2-Step Verification (on)
@@ -33,21 +34,19 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import db
+import config
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(HERE, "email_config.json")
 
 
 def load_config():
-    # Env-var override (handy for cron); else the json file.
-    if os.environ.get("PATHO_SMTP_APP_PASSWORD"):
-        return {
-            "smtp_host": os.environ.get("PATHO_SMTP_HOST", "smtp.gmail.com"),
-            "smtp_port": int(os.environ.get("PATHO_SMTP_PORT", "465")),
-            "sender": os.environ["PATHO_SMTP_SENDER"],
-            "app_password": os.environ["PATHO_SMTP_APP_PASSWORD"],
-            "recipients": os.environ.get("PATHO_SMTP_RECIPIENTS", os.environ["PATHO_SMTP_SENDER"]).split(","),
-        }
+    # Prefer env-driven config (SMTP_SENDER / SMTP_APP_PASSWORD / ALERT_RECIPIENTS),
+    # then fall back to the local email_config.json file. Returns None if neither
+    # is configured so alerts are simply skipped.
+    env_cfg = config.email_config()
+    if env_cfg is not None:
+        return env_cfg
     if not os.path.exists(CONFIG_PATH):
         return None
     with open(CONFIG_PATH) as f:

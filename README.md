@@ -35,7 +35,7 @@ saved in that browser (local storage). "Update now" only works on the desktop ap
 The daily pipeline rebuilds `public/` and redeploys it automatically. To redeploy
 by hand: `cd public && vercel deploy --prod --yes`.
 
-## 📧 Email alerts for NEW pathology posts  → vbhvverma7@gmail.com
+## 📧 Email alerts for NEW pathology posts
 You get an email **only when a genuinely new pathology post appears** (high-relevance
 items: pathology/haematology/cytology/histopathology/transfusion/lab-medicine).
 Already-seen posts never re-alert.

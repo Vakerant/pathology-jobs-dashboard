@@ -20,6 +20,7 @@ from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 
 import db
+import config
 from sources import SOURCES, RECRUIT_KEYWORDS, PATHOLOGY_KEYWORDS, STOPWORDS, JUNK_TITLES
 
 log = logging.getLogger("scraper")
@@ -38,8 +39,11 @@ MAX_ITEMS_PER_SOURCE = 60
 MAX_WORKERS = 10
 
 # Hosts that genuinely need verify=False (broken cert chain). Default empty — secure by default.
-# Override via env: PATHO_INSECURE_HOSTS="host1,host2"
-_INSECURE_HOSTS = {h.strip().lower() for h in os.environ.get("PATHO_INSECURE_HOSTS", "").split(",") if h.strip()}
+# Merged with config.INSECURE_HOSTS (which carries the built-in govt defaults)
+# plus any PATHO_INSECURE_HOSTS env overrides.
+_INSECURE_HOSTS = {h.strip().lower() for h in
+                   (set(os.environ.get("PATHO_INSECURE_HOSTS", "").split(",")) | config.INSECURE_HOSTS)
+                   if h.strip()}
 
 def _is_insecure_host(url: str) -> bool:
     try:
@@ -82,7 +86,7 @@ def _mk(y, m, d):
 # Words that, appearing shortly before a date, mark it as a DEADLINE / event
 # date (last date to apply, walk-in date) rather than a publish date.
 _DEADLINE_HINT = re.compile(
-    r"(last\s*date|closing\s*date|apply\s*(?:by|before|on\s*or\s*before|up\s*to|upto)"
+    r"(last\s*date|closing\s*date|clos(?:e|es|ing)\s*on|apply\s*(?:by|before|on\s*or\s*before|up\s*to|upto)"
     r"|on\s*or\s*before|walk[\s\-]?in|interview\s*(?:on|date|dated|scheduled)"
     r"|up\s*to|upto|till|extended\s*(?:to|till|upto)|deadline)",
     re.I)
@@ -156,8 +160,6 @@ NEGATIVE = [
     "president - institute", "president - cib", "non-faculty group",
     # Sales / non-clinical roles
     "sales manager", "territory sales", "business development",
-    # Corrigendum / addendum notices (not actual vacancies)
-    "corrigendum:", "addendum:", "extension of application",
     # Nursing-specific (not pathology)
     "tutor (nursing)", "nursing tutor",
 ]
@@ -188,6 +190,46 @@ def relevance(text):
     if any(k in t for k in RECRUIT_KEYWORDS) and len(t) >= 12:
         return "medium"
     return None
+
+
+# document_type values MUST mirror the documents.document_type enum defined in
+# migrations._migrate_phase2_domain: ADVERTISEMENT | CORRIGENDUM | ADDENDUM |
+# EXTENSION | INTERVIEW_NOTICE | SHORTLIST | RESULT | CANCELLATION |
+# RECRUITMENT_RULE | UNKNOWN.
+DOCUMENT_TYPE_RULES = [
+    ("CANCELLATION",     (r"\bcancel",)),
+    ("EXTENSION",        (r"\bextension\b", r"\bextended\b", r"\bpostponed\b", r"\bre-scheduled\b", r"\brescheduled\b")),
+    ("CORRIGENDUM",      (r"\bcorrigendum\b", r"\bcorrection\b", r"\bamendment\b", r"\berrata\b", r"\bmodification\b")),
+    ("ADDENDUM",         (r"\baddendum\b", r"\baddenda\b", r"\bclarification\b")),
+    ("INTERVIEW_NOTICE", (r"\binterview\b", r"\bwalk[-\s]?in\b", r"\bdocument verification\b")),
+    ("SHORTLIST",        (r"\bshortlist", r"\bprovisional list\b", r"\beligible candidates\b", r"\beligibility list\b")),
+    ("RESULT",           (r"\bresult\b", r"\bselected candidates\b", r"\bfinal merit\b", r"\bmerit list\b")),
+    ("RECRUITMENT_RULE", (r"\brecruitment rules\b", r"\brecruitment & assessment\b", r"\bscheme of examination\b")),
+    ("ADVERTISEMENT",    (r"\bwalk[-\s]?in\s+interview\b", r"\bapplications? are invited\b", r"\badvt", r"\badvertisement\b", r"\bvacanc", r"\brecruitment\b")),
+]
+_COMPILED_DOC_RULES = [
+    (doc_type, [re.compile(pat, re.I) for pat in pats])
+    for doc_type, pats in DOCUMENT_TYPE_RULES
+]
+
+
+def classify_document_type(text):
+    """Classify a recruitment document from its link/row text.
+
+    Returns one of the document_type enum values (see DOCUMENT_TYPE_RULES).
+    Ordering encodes precedence: explicit amendments (corrigendum/addendum/
+    extension/cancellation) win over lifecycle notices (interview/shortlist/
+    result) which win over a plain advertisement. Defaults to UNKNOWN when no
+    signal matches — never guesses.
+    """
+    t = _clean(text)
+    if not t:
+        return "UNKNOWN"
+    for doc_type, pats in _COMPILED_DOC_RULES:
+        for pat in pats:
+            if pat.search(t):
+                return doc_type
+    return "UNKNOWN"
 
 
 def _row_text(a):
@@ -239,7 +281,11 @@ def _candidates(html, base_url):
         if k in seen:
             continue
         seen.add(k)
-        yield {"title": disp, "url": url, "rel": rel, "notice_date": nd, "deadline": dl}
+        yield {
+            "title": disp, "url": url, "rel": rel,
+            "notice_date": nd, "deadline": dl,
+            "document_type": classify_document_type(f"{title} {href} {ctx}"),
+        }
 
 
 def scrape_source(src, session=None):
@@ -264,6 +310,7 @@ def scrape_source(src, session=None):
                 "title": it["title"], "url": it["url"], "relevance": it["rel"],
                 "snippet": "", "is_seed": 0, "notice_date": it["notice_date"],
                 "deadline": it["deadline"],
+                "document_type": it.get("document_type", "UNKNOWN"),
             })
             if is_new:
                 new_count += 1

@@ -92,7 +92,7 @@ SOURCES = [
     {"id": "haryana_health", "name": "Haryana Health Department", "region": "Haryana",
      "category": "Govt – Recruitment", "url": "https://haryanahealth.gov.in/notice-category/recruitments/"},
     {"id": "uhsr_rohtak", "name": "PGIMS / UHS Rohtak", "region": "Haryana",
-     "category": "Govt – Senior Resident", "url": "https://uhsr.ac.in/detailsleft.aspx?artid=27"},
+     "category": "Govt – Senior Resident", "url": "https://uhsr.ac.in/recruitment-advertisement"},
 
     # ---------------- INSTITUTES OF NATIONAL IMPORTANCE ----------------
     {"id": "aiims_bhopal", "name": "AIIMS Bhopal", "region": "INI – Other",
