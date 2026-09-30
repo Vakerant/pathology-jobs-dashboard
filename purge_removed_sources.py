@@ -54,6 +54,34 @@ REMOVED_SOURCE_NAMES = [
 REMOVED_REGIONS = ["Private / Metro"]
 
 
+def _off_scope_keys(conn: sqlite3.Connection) -> list[str]:
+    """Keys of stored listings that match the strict-scope blocklist.
+
+    Scoped deliberately NARROW: only rows whose title contains an explicit
+    OFF_SCOPE_PATHS term (oral pathology / dental / veterinary / ...). This is
+    *not* "everything scraper.relevance() rejects" -- relevance() also returns
+    None for legitimate listings whose title happens to omit a pathology
+    keyword, so using it as the delete predicate would destroy good data.
+
+    These rows were scraped before OFF_SCOPE_PATHS existed. The filter itself
+    works; this only cleans up the backlog it left behind.
+    """
+    from sources import OFF_SCOPE_PATHS
+
+    keys, titles = [], []
+    for key, title in conn.execute("SELECT key, title FROM listings"):
+        low = (title or "").lower()
+        if any(k in low for k in OFF_SCOPE_PATHS):
+            keys.append(key)
+            titles.append(title)
+
+    if titles:
+        print(f"off-scope backlog (title matches OFF_SCOPE_PATHS): {len(keys)}")
+        for t in titles[:20]:
+            print(f"   - {t[:88]}")
+    return keys
+
+
 def _predicates(conn: sqlite3.Connection) -> tuple[str, list]:
     """Build the shared WHERE clause for source_id / source_name / region."""
     clauses = []
@@ -87,6 +115,9 @@ def main() -> int:
     listing_keys = [
         r[0] for r in conn.execute(f"SELECT key FROM listings WHERE {where}", params)
     ]
+    # Backlog rows the strict-scope filter would now reject. Deduplicated
+    # against the source-removal set so a row matching both is deleted once.
+    listing_keys = sorted(set(listing_keys) | set(_off_scope_keys(conn)))
     opportunity_ids = [
         r[0]
         for r in conn.execute(
