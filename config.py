@@ -139,8 +139,21 @@ def email_config() -> dict | None:
 # ---------------------------------------------------------------------------
 # Admin / security
 # ---------------------------------------------------------------------------
-ADMIN_SECRET = _env("ADMIN_SECRET")           # unset => admin route is disabled
+# NOTE: ADMIN_SECRET is not read by any code path. It is retained so existing
+# .env files keep loading, but the old comment ("unset => admin route is
+# disabled") described a control that did not exist -- there is no /admin route
+# at all. The dashboard's own JS calls /api/flag and /api/refresh, so those
+# routes cannot require a secret without breaking the product: anything the
+# browser can send is public by definition. The control that IS enforced is the
+# rate limiter in app.py. Keep this honest -- a documented-but-unimplemented
+# security promise is worse than none.
+ADMIN_SECRET = _env("ADMIN_SECRET")
+# Enforced per client IP on /api/flag (one row write per request).
 ADMIN_RATE_LIMIT = _env_int("ADMIN_RATE_LIMIT", 30)   # req/min
+# Enforced per client IP on /api/refresh. Much tighter because one request
+# fans out to len(sources.SOURCES) concurrent scrapes of government servers;
+# 30/min there would be 1400+ outbound scrapes a minute from a single caller.
+REFRESH_RATE_LIMIT = _env_int("REFRESH_RATE_LIMIT", 5)   # req/min
 FLAG_KEY_RE = re.compile(r"^[0-9a-f]{40}$")   # listing keys are 40-char hex
 
 # ---------------------------------------------------------------------------

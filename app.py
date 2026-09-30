@@ -6,6 +6,8 @@
 """
 import logging
 import threading
+import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, jsonify, render_template, request
@@ -52,6 +54,107 @@ _shutdown = threading.Event()
 # Flag allowlist — never interpolate user input into SQL without this.
 ALLOWED_FLAG_FIELDS = {"starred", "hidden"}
 _KEY_RE = config.FLAG_KEY_RE
+
+
+# ---------------------------------------------------------------------------
+# Abuse protection for the mutating endpoints
+# ---------------------------------------------------------------------------
+# The dashboard's own JS is the only client for both /api/refresh and /api/flag
+# (templates/dashboard.html calls them around L951 and L980), so neither can be
+# gated behind a secret: anything the browser can send is public by definition,
+# and requiring a token would simply break the shipped dashboard.
+#
+# Rate limiting is therefore the control that actually matters. Without it, one
+# POST /api/refresh fans out to len(SOURCES) concurrent scrapes against
+# government servers, so any reachable caller becomes an amplifier. This is what
+# makes config.ADMIN_RATE_LIMIT a real control rather than dead config.
+_RATE_LIMIT_LOCK = threading.Lock()
+# client ip -> deque of monotonic timestamps inside the current window
+_RATE_BUCKETS: dict[str, deque] = {}
+# Hard cap on tracked IPs: a rotating-source-address flood must not be able to
+# grow this dict without bound. Buckets whose window has fully expired go first.
+_RATE_MAX_BUCKETS = 4096
+_RATE_WINDOW_SECONDS = 60.0
+
+# Path -> allowed requests per window. refresh is orders of magnitude more
+# expensive than flag (one DB row write vs a whole multi-source network scrape),
+# so it gets a much tighter allowance.
+_RATE_LIMITED_PATHS = {
+    "/api/refresh": config.REFRESH_RATE_LIMIT,
+    "/api/flag": config.ADMIN_RATE_LIMIT,
+}
+
+
+def _rate_limit_reset():
+    """Forget every recorded request timestamp. Test hook."""
+    with _RATE_LIMIT_LOCK:
+        _RATE_BUCKETS.clear()
+
+
+def _consume_rate_limit(limit):
+    """Sliding-window per-IP limiter.
+
+    Returns None when the request may proceed, or (retry_after_seconds, limit)
+    when it must be rejected with HTTP 429.
+    """
+    ident = request.remote_addr or "unknown"
+    now = time.monotonic()
+    with _RATE_LIMIT_LOCK:
+        bucket = _RATE_BUCKETS.setdefault(ident, deque())
+        # Drop timestamps that have slid out of the window.
+        while bucket and now - bucket[0] >= _RATE_WINDOW_SECONDS:
+            bucket.popleft()
+        if len(bucket) >= limit:
+            retry_after = max(1, int(_RATE_WINDOW_SECONDS - (now - bucket[0])))
+            return retry_after, limit
+        bucket.append(now)
+        # Opportunistic prune, then cap. Keeps memory bounded even if the
+        # limiter is being attacked from rotating addresses.
+        #
+        # This MUST sweep every bucket by its own oldest timestamp, not just
+        # delete empty ones: a bucket is only emptied by the sliding-window trim
+        # above, which runs for the REQUESTING ip alone. Deleting only empty
+        # buckets can therefore never free a quiet client, and every such ip
+        # would sit resident until the hard cap evicted it.
+        if len(_RATE_BUCKETS) > 1:
+            stale = [ip for ip, ts in _RATE_BUCKETS.items()
+                     if now - ts[0] >= _RATE_WINDOW_SECONDS]
+            for ip in stale:
+                if ip != ident:
+                    del _RATE_BUCKETS[ip]
+        if len(_RATE_BUCKETS) > _RATE_MAX_BUCKETS:
+            for ip in list(_RATE_BUCKETS)[: len(_RATE_BUCKETS) - _RATE_MAX_BUCKETS]:
+                del _RATE_BUCKETS[ip]
+    return None
+
+
+@app.before_request
+def _enforce_rate_limit():
+    """Throttle the mutating endpoints only.
+
+    GET / and GET /api/data are deliberately NOT limited: the dashboard polls
+    them, and a 429 there would break the product for no security benefit.
+    """
+    limit = _RATE_LIMITED_PATHS.get(request.path)
+    if not limit or limit <= 0:
+        return None
+    denial = _consume_rate_limit(limit)
+    if denial is None:
+        return None
+    retry_after, cap = denial
+    log.warning(
+        "rate limit exceeded: %s on %s (limit %d per %ds)",
+        request.remote_addr, request.path, cap, int(_RATE_WINDOW_SECONDS),
+    )
+    resp = jsonify({
+        "ok": False,
+        "error": "rate limit exceeded",
+        "limit": cap,
+        "window_seconds": int(_RATE_WINDOW_SECONDS),
+    })
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry_after)
+    return resp
 
 
 def _validate_env():

@@ -735,6 +735,16 @@ def scrape_source(src, session=None):
                     log.info("pdf enrich failed %s: %s", it.get("url"), type(exc).__name__)
         found = 0
         for it in items:
+            # Final scope backstop. relevance() judges a link's own text, but the
+            # title we persist can come from a heading or document title that
+            # carries the off-scope term instead -- e.g. a generic "Download"
+            # link sitting on a page headed "Senior Residents (Dental)". Judging
+            # only the link text let dental/MDS notices through, so re-check the
+            # exact string about to be written. Narrow blocklist on purpose: a
+            # broader "title must mention pathology" rule would also reject
+            # legitimate notices that simply omit the word.
+            if _off_scope(it.get("title", "")):
+                continue
             found += 1
             is_new = db.upsert_listing({
                 "source_id": src["id"], "source_name": src["name"],

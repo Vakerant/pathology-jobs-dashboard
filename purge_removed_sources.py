@@ -30,6 +30,7 @@ import sqlite3
 import sys
 
 import db
+import sources as source_registry
 
 # Source ids that were deliberately removed from sources.py. Keep in sync with
 # git history: `git log -p -- sources.py` shows which ids were dropped and when.
@@ -80,6 +81,21 @@ def _off_scope_keys(conn: sqlite3.Connection) -> list[str]:
         for t in titles[:20]:
             print(f"   - {t[:88]}")
     return keys
+
+
+def _orphaned_source_ids(conn: sqlite3.Connection) -> list[str]:
+    """Source ids present in bookkeeping tables but absent from sources.SOURCES.
+
+    Dropping a source from SOURCES stops future scrapes but leaves its rows in
+    ``source_status`` / ``source_runs`` forever. Those stale rows keep reporting
+    ``status='ok'``, so the dashboard advertised "47 sources OK" while only 44
+    of the 45 configured sources had actually succeeded -- an operator reading
+    the counter had no way to tell the difference. This makes the counter
+    trustworthy by deriving it from SOURCES instead of from history.
+    """
+    live = {s["id"] for s in source_registry.SOURCES}
+    seen = {r[0] for r in conn.execute("SELECT source_id FROM source_status")}
+    return sorted(seen - live)
 
 
 def _predicates(conn: sqlite3.Connection) -> tuple[str, list]:
@@ -148,11 +164,15 @@ def main() -> int:
             )
         ]
 
+    orphan_ids = _orphaned_source_ids(conn)
+
     print(f"listings matched    : {len(listing_keys)}")
     print(f"opportunities matched: {len(opportunity_ids)}")
     print(f"documents matched    : {len(doc_ids)}")
+    print(f"orphaned source ids  : {len(orphan_ids)}"
+          + (f"  {orphan_ids}" if orphan_ids else ""))
 
-    if not (listing_keys or opportunity_ids or doc_ids):
+    if not (listing_keys or opportunity_ids or doc_ids or orphan_ids):
         print("\nnothing to do -- already clean")
         conn.close()
         return 0
@@ -163,6 +183,10 @@ def main() -> int:
         return 0
 
     conn.execute("PRAGMA foreign_keys = OFF")
+    if orphan_ids:
+        qs = ",".join("?" * len(orphan_ids))
+        conn.execute(f"DELETE FROM source_runs WHERE source_id IN ({qs})", orphan_ids)
+        conn.execute(f"DELETE FROM source_status WHERE source_id IN ({qs})", orphan_ids)
     if doc_ids:
         qs = ",".join("?" * len(doc_ids))
         conn.execute(f"DELETE FROM documents WHERE document_id IN ({qs})", doc_ids)

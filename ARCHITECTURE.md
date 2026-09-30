@@ -250,12 +250,23 @@ committing a drifting `public/data.json`.
 
 Done since the 2026-09 audit, and therefore no longer "remaining": CI now runs
 the test suite and gates publishing (item 10), the opportunity projection is
-kept in sync and orphan-free (part of item 5), and the in-process scrape slot is
-atomic with graceful shutdown (part of item 10). Still open: items 3, 4, 6, 7,
-8, 9, and the auth/observability half of item 10 — `/api/refresh` and
-`/api/flag` remain unauthenticated (localhost-bound only), and `ADMIN_SECRET` /
-`ADMIN_RATE_LIMIT` in `config.py` are still unused because no `/admin` route
-consumes them.
+kept in sync and orphan-free (part of item 5), the in-process scrape slot is
+atomic with graceful shutdown (part of item 10), scrape runs are recorded in
+`scrape_runs` / `source_runs` so a run leaves auditable history, and the two
+mutating endpoints (`/api/refresh`, `/api/flag`) are now protected by a per-IP
+sliding-window rate limiter in `app.py` — `REFRESH_RATE_LIMIT` (5/min) and
+`ADMIN_RATE_LIMIT` (30/min), both configurable and enforced, with the read-only
+`GET /` and `GET /api/data` deliberately exempt because the UI polls them.
+
+`ADMIN_SECRET` is *not* a control and must not be documented as one. No code
+path reads it and no route requires it: the dashboard's own JavaScript POSTs to
+both endpoints, so anything the browser can send is public by definition.
+Token auth on those routes would break the shipped Star and Refresh buttons.
+The honest remaining gap is the auth/observability half of item 10, which needs
+a real authenticated surface (item 9's protected admin) rather than a header
+the client cannot keep.
+
+Still open: items 3, 4, 6, 7, 8, and 9.
 
 ## 6. Non-negotiable constraints (carried from the master directive)
 

@@ -23,8 +23,18 @@ def client(monkeypatch):
     releases the scrape slot, so replacing it would make the release path
     untestable. We stub ``scraper.run`` / ``alerts.send_new`` /
     ``export_static.build`` instead and let the real orchestration run.
+
+    The per-IP rate limiter is also lifted here. This module asserts on the
+    scrape slot, and the slot's contract is "one 202, everyone else 200 +
+    started:false" across 12 concurrent callers — which is deliberately more
+    calls per minute than ``config.REFRESH_RATE_LIMIT`` allows. Throttling is
+    covered by tests/test_security_hardening.py; here it would only mask the
+    race this file exists to detect.
     """
     A.app.config["TESTING"] = True
+    monkeypatch.setattr(A, "_RATE_LIMITED_PATHS",
+                        {"/api/refresh": 10_000, "/api/flag": 10_000})
+    A._rate_limit_reset()
     monkeypatch.setattr(A.scraper, "run", lambda verbose=False: 0)
     monkeypatch.setattr(A.alerts, "send_new", lambda verbose=False: 0)
     monkeypatch.setattr(A.export_static, "build", lambda: None)
