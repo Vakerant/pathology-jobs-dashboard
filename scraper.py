@@ -767,9 +767,19 @@ def run(verbose=True):
         futures = {pool.submit(scrape_source, src, _session()): src for src in SOURCES}
         results = {}
         for fut in as_completed(futures):
-            results[futures[fut]["id"]] = fut.result()
+            # A source can raise something scrape_source did not anticipate
+            # (a stray decode error, a driver-level exception). Without this
+            # guard the exception escapes run(), the run row stays stuck at
+            # status='running' forever, and one bad source aborts the other
+            # 47. Record it as a failed source and keep going.
+            try:
+                results[futures[fut]["id"]] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                sid = futures[fut]["id"]
+                log.warning("source %s raised: %s", sid, exc)
+                results[sid] = (0, f"unhandled: {exc}"[:300])
     for src in SOURCES:                      # report in registry order
-        new, err = results[src["id"]]
+        new, err = results.get(src["id"], (0, "no result returned"))
         total_new += new
         if err:
             failed += 1

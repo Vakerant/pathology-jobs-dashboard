@@ -184,3 +184,46 @@ def test_run_history_survives_a_crashed_run(tmp_path, monkeypatch):
     conn.close()
     assert row["status"] == "running"
     assert row["finished_at"] is None, "an unfinished run must not claim a finish time"
+
+
+def test_one_raising_source_cannot_abort_the_run(tmp_path, monkeypatch):
+    """A source that raises must not kill the other 47 or strand the run row.
+
+    `scrape_source` handles its own errors, but an unforeseen exception
+    (decode error, driver fault) would previously escape `run()`, leaving the
+    `scrape_runs` row stuck at status='running' forever — the precise
+    traceability gap the run-history audit was meant to close.
+    """
+    import db
+    import scraper
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "boom.db"))
+    db.init_db()
+
+    def fake_scrape(src, session=None):
+        if src["id"] == "explodes":
+            raise RuntimeError("unexpected decoder fault")
+        return (1, None)
+
+    monkeypatch.setattr(scraper, "scrape_source", fake_scrape)
+    monkeypatch.setattr(scraper, "SOURCES", [
+        {"id": "explodes", "name": "Explodes", "region": "R", "category": "C", "url": "https://x"},
+        {"id": "fine", "name": "Fine", "region": "R", "category": "C", "url": "https://y"},
+    ])
+    monkeypatch.setattr(scraper, "db", db)
+    monkeypatch.setattr(scraper, "MAX_WORKERS", 2)
+
+    scraper.run(verbose=False)
+
+    conn = db.get_conn()
+    run_row = conn.execute("SELECT status, ok, failed FROM scrape_runs").fetchone()
+    per_source = {
+        r["source_id"]: r["status"]
+        for r in conn.execute("SELECT source_id, status FROM source_runs")
+    }
+    conn.close()
+
+    assert run_row["status"] == "partial", run_row["status"]
+    assert (run_row["ok"], run_row["failed"]) == (1, 1), tuple(run_row)
+    # The healthy source must still have been recorded as ok.
+    assert per_source == {"explodes": "failed", "fine": "ok"}, per_source
