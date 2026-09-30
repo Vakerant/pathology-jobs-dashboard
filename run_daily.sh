@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Daily pipeline (invoked by cron). Logs to scrape.log.
+# Daily pipeline (invoked by the systemd user timer pathology-scrape.timer,
+# NOT cron -- `crontab -l` is empty on purpose). Logs to scrape.log.
 #   1. refresh verified seeds        2. scrape live notices
 #   3. email alert for NEW pathology 4. rebuild static site
 #   5. redeploy mirror to Vercel (mobile)

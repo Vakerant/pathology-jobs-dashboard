@@ -758,6 +758,11 @@ def run(verbose=True):
     db.init_db()
     total_new = 0
     ok, failed = 0, 0
+    # Open a run row up-front so a crashed or killed run is still visible in
+    # `scrape_runs` (status 'running') instead of vanishing with no trace.
+    run_id = f"run-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    started = datetime.now(timezone.utc).isoformat()
+    db.record_run_start(run_id, started, len(SOURCES))
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         futures = {pool.submit(scrape_source, src, _session()): src for src in SOURCES}
         results = {}
@@ -768,10 +773,14 @@ def run(verbose=True):
         total_new += new
         if err:
             failed += 1
+            db.record_source_run(run_id, src["id"], "failed", 0, 0, err[:300])
             if verbose:
                 print(f"  ✗ {src['name']:<42} {err[:60]}")
         else:
             ok += 1
+            http = db.get_source_http_status(src["id"])
+            found = db.get_source_items_found(src["id"])
+            db.record_source_run(run_id, src["id"], "ok", http, found, "")
             if verbose:
                 print(f"  ✓ {src['name']:<42} (+{new} new)")
     pruned = db.prune_stale()
@@ -791,6 +800,13 @@ def run(verbose=True):
     db.set_meta("last_run_new", total_new)
     db.set_meta("last_run_ok", ok)
     db.set_meta("last_run_failed", failed)
+    # 'partial' is the honest label when some sources failed: the listings we
+    # did collect are valid and committed, so this is not a total failure.
+    db.record_run_finish(
+        run_id, datetime.now(timezone.utc).isoformat(),
+        "success" if not failed else "partial",
+        total_sources=len(SOURCES), ok=ok, failed=failed, new_items=total_new,
+    )
     if projection is not None:
         db.set_meta("last_run_projection_ok", int(projection["ok"]))
         db.set_meta("last_run_orphans", projection["orphans"])

@@ -123,3 +123,64 @@ def test_ci_byte_compiles_every_module():
     cmd = step.group(0)
     for module in ("alerts.py", "export_static.py", "seed.py", "sources.py"):
         assert module in cmd, f"{module} is not byte-compiled in CI"
+
+
+# ---------------------------------------------------------------------------
+# F9 — scrape_runs / source_runs were dead schema
+#
+# migrations.py created both tables, but nothing ever wrote a row. A scrape run
+# left no auditable history, so "when did this last run and what did each source
+# return" was unanswerable. `meta` held only the aggregate counters, which any
+# ad-hoc single-source scrape silently overwrites.
+# ---------------------------------------------------------------------------
+def test_run_history_round_trips(tmp_path, monkeypatch):
+    """A run must be openable before the work starts and closable after."""
+    import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "runs.db"))
+    db.init_db()
+
+    rid = "run-unit-test"
+    db.record_run_start(rid, "2026-10-01T00:00:00+00:00", 48)
+    db.record_source_run(rid, "natboard", "failed", 403, 0, "HTTP 403")
+    db.record_source_run(rid, "aiims_bhopal", "ok", 200, 12, "")
+    db.record_run_finish(
+        rid, "2026-10-01T00:01:00+00:00", "partial", 48, 47, 1, 530
+    )
+
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT status, total_sources, ok, failed, new_items FROM scrape_runs"
+        " WHERE run_id=?", (rid,)
+    ).fetchone()
+    assert tuple(row) == ("partial", 48, 47, 1, 530), tuple(row)
+
+    per_source = dict(
+        conn.execute(
+            "SELECT source_id, status FROM source_runs WHERE run_id=?", (rid,)
+        ).fetchall()
+    )
+    assert per_source == {"natboard": "failed", "aiims_bhopal": "ok"}, per_source
+    conn.close()
+
+
+def test_run_history_survives_a_crashed_run(tmp_path, monkeypatch):
+    """`record_run_start` must write a 'running' row up front.
+
+    If the row were only written at the end, a run killed mid-scrape would
+    leave no trace at all — the exact failure the audit surfaced.
+    """
+    import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "crash.db"))
+    db.init_db()
+
+    db.record_run_start("run-crashed", "2026-10-01T00:00:00+00:00", 48)
+    # deliberately no record_run_finish -- simulates a kill
+    conn = db.get_conn()
+    row = conn.execute(
+        "SELECT status, finished_at FROM scrape_runs WHERE run_id='run-crashed'"
+    ).fetchone()
+    conn.close()
+    assert row["status"] == "running"
+    assert row["finished_at"] is None, "an unfinished run must not claim a finish time"

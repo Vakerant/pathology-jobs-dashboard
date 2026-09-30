@@ -278,6 +278,63 @@ def record_status(source_id, source_name, region, status, http_status, items_fou
     conn.close()
 
 
+def record_run_start(run_id, started_at, total_sources):
+    """Open a `scrape_runs` row. Written BEFORE any network work so a run that
+    is killed or crashes still leaves a 'running' row behind."""
+    conn = get_conn()
+    conn.execute(
+        "INSERT OR REPLACE INTO scrape_runs (run_id, started_at, status, total_sources)"
+        " VALUES (?,?,'running',?)",
+        (run_id, started_at, total_sources),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_run_finish(run_id, finished_at, status, total_sources, ok, failed, new_items):
+    conn = get_conn()
+    conn.execute(
+        """UPDATE scrape_runs
+              SET finished_at=?, status=?, total_sources=?, ok=?, failed=?, new_items=?
+            WHERE run_id=?""",
+        (finished_at, status, total_sources, ok, failed, new_items, run_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def record_source_run(run_id, source_id, status, http_status, items_found, error=""):
+    conn = get_conn()
+    conn.execute(
+        """INSERT OR REPLACE INTO source_runs
+           (source_run_id, run_id, source_id, status, http_status, items_found, error, started_at, finished_at)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (f"{run_id}:{source_id}", run_id, source_id, status,
+         http_status, items_found, error,
+         datetime.now(timezone.utc).isoformat(), datetime.now(timezone.utc).isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_source_http_status(source_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT http_status FROM source_status WHERE source_id=?", (source_id,)
+    ).fetchone()
+    conn.close()
+    return (row or [0])[0] or 0
+
+
+def get_source_items_found(source_id):
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT items_found FROM source_status WHERE source_id=?", (source_id,)
+    ).fetchone()
+    conn.close()
+    return (row or [0])[0] or 0
+
+
 def set_meta(k, v):
     conn = get_conn()
     conn.execute("INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v", (k, str(v)))
