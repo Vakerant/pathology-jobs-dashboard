@@ -17,6 +17,22 @@ RECRUIT_KEYWORDS = [
     "job", "opening", "post ", "posts", "hiring", "consultant",
 ]
 
+# STRICT SCOPE GUARD -- this tracker is for MD (Human) Pathology ONLY.
+# These strings are pathology-ADJACENT but belong to a different degree or
+# discipline. They must be tested BEFORE PATHOLOGY_KEYWORDS because
+# "oral pathologist" and "veterinary pathologist" both contain the substring
+# "patholog", so a positive-only test would happily keep them.
+OFF_SCOPE_PATHS = [
+    # --- Dental / oral (MDS; Oral Medicine & Radiology / Oral & Maxillofacial Surgery) ---
+    "oral patho", "oral patholog", "oral medicin", "oral surg",
+    "oral & maxillofacial", "oral and maxillofacial", "maxillofacial",
+    "dental", "dentist", "periodont", "endodont", "orthodont",
+    "prosthodont", "oral cytolog",
+    # --- Non-human / non-medical pathology ---
+    "veterinar", "animal patholog", "plant patholog", "comparative patho",
+    "fish patholog", "poultry patholog",
+]
+
 # Words that make an item HIGH relevance -- clearly PATHOLOGY (not other specialities).
 # NOTE: microbiology / clinical oncology / general SR are deliberately excluded.
 PATHOLOGY_KEYWORDS = [
@@ -36,6 +52,11 @@ JUNK_TITLES = {
     "apply now", "details", "more", "view", "pdf", "click", "here", "link",
     "notification", "read", "open", "advertisement", "advt", "notice", "new",
     "corrigendum", "result", "results",
+    # Uninformative document stubs. Many govt sites render every document link
+    # with identical boilerplate text ("View Document"), which is why the real
+    # title has to come from the document body — see scraper._pdf_subject().
+    "view document", "open document", "view doc", "open pdf", "document",
+    "documents", "download pdf", "click to view", "click here to view",
     # Admin / navigation pages that are not job notices
     "non-faculty", "faculty", "fellowship", "recruitment rules",
     "presidency", "president",
@@ -65,6 +86,8 @@ SOURCES = [
      "category": "Govt – Vacancies", "url": "https://health.delhi.gov.in/vacancy"},
     {"id": "icmr_nip", "name": "ICMR National Institute of Pathology", "region": "Delhi / INI",
      "category": "Research – Senior Resident", "url": "https://www.icmr.gov.in/whats-new"},
+    {"id": "delhi_health_vacancy", "name": "Delhi Health & Family Welfare (Vacancy Page)", "region": "Delhi",
+     "category": "Govt – Vacancies", "url": "https://health.delhi.gov.in/health/vacancy"},
 
     # ---------------- CHANDIGARH ----------------
     {"id": "pgimer", "name": "PGIMER Chandigarh (Vacancies)", "region": "Chandigarh / INI",
@@ -100,7 +123,17 @@ SOURCES = [
      {"id": "aiims_jodhpur", "name": "AIIMS Jodhpur", "region": "INI – Other",
       "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/"},
     {"id": "aiims_rishikesh", "name": "AIIMS Rishikesh", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsrishikesh.edu.in/aiims/en/recruitment.html"},
+     "category": "INI – Senior Resident", "url": "https://aiimsrishikesh.edu.in/job-new.php"},
+    {"id": "aiims_raipur", "name": "AIIMS Raipur (Chhattisgarh)", "region": "INI – Other",
+     "category": "INI – Senior Resident", "url": "https://aiimsraipur.edu.in/"},
+    {"id": "aiims_nagpur", "name": "AIIMS Nagpur", "region": "INI – Other",
+     "category": "INI – Senior Resident", "url": "https://aiimsnagpur.edu.in/recruitment"},
+    {"id": "aiims_guwahati", "name": "AIIMS Guwahati", "region": "INI – Other",
+     "category": "INI – Senior Resident", "url": "https://aiimsguwahati.ac.in/"},
+    {"id": "aiims_raebareli", "name": "AIIMS Raebareli", "region": "INI – Other",
+     "category": "INI – Senior Resident", "url": "https://aiimsrbl.edu.in/"},
+    {"id": "aiims_deoghar", "name": "AIIMS Deoghar (Jharkhand)", "region": "INI – Other",
+     "category": "INI – Senior Resident", "url": "https://www.aiimsdeoghar.edu.in/notice/list"},
     {"id": "aiims_bbsr", "name": "AIIMS Bhubaneswar", "region": "INI – Other",
      "category": "INI – Senior Resident", "url": "https://aiimsbhubaneswar.nic.in/recruitment-notice/"},
     {"id": "aiims_bilaspur", "name": "AIIMS Bilaspur (HP)", "region": "INI – Other",
@@ -129,12 +162,31 @@ SOURCES = [
      "category": "Fellowship – Paid", "url": "https://tmckolkata.com/"},
     {"id": "natboard", "name": "National Board (DrNB / FNB)", "region": "Fellowship",
      "category": "Fellowship – DrNB/FNB", "url": "https://natboard.edu.in/"},
+    {"id": "nib_genomics", "name": "NIB – National Institute of Biomedical Genomics", "region": "Fellowship",
+     "category": "Fellowship – Paid", "url": "https://www.nib.gov.in/"},
+    # www.icmr.gov.in serves an incomplete TLS cert chain. It is listed in
+    # config.INSECURE_HOSTS so the scraper uses verify=False -- still HTTPS, just
+    # not chain-verified. Verified: https + verify=False -> 200, http -> 200.
+    {"id": "icmr", "name": "ICMR – Indian Council of Medical Research", "region": "Fellowship",
+     "category": "Fellowship – JRF / Research", "url": "https://www.icmr.gov.in/"},
 
-    # ---------------- PRIVATE DIAGNOSTIC CHAINS (Consultant Pathologist) ----------------
-    {"id": "lalpathlabs", "name": "Dr Lal PathLabs – Careers", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "url": "https://www.lalpathlabs.com/career/job-opening-list"},
-    {"id": "metropolis", "name": "Metropolis Healthcare – Careers", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "url": "https://www.metropolisindia.com/careers"},
-    {"id": "agilus", "name": "Agilus Diagnostics (SRL) – Careers", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "url": "https://www.agilusdiagnostics.com/agilus-careers"},
+    # ---------------- OTHER STATES: top govt medical colleges ----------------
+    # Recruitment for a state's govt colleges is usually consolidated on the
+    # state's Directorate of Medical Education / Health Department portal rather
+    # than on each college's own site, so one portal per state is used here.
+    {"id": "uk_medical_education", "name": "Uttarakhand Dept of Medical Education (All GMC SR/JR)",
+     "region": "Uttarakhand", "category": "Govt – Senior Resident",
+     "url": "https://medicaleducation.uk.gov.in/"},
+    {"id": "uk_health", "name": "Uttarakhand Dept of Medical Health & Family Welfare",
+     "region": "Uttarakhand", "category": "Govt – Vacancies", "url": "https://health.uk.gov.in/"},
+    {"id": "punjab_health", "name": "Punjab Dept of Health & Family Welfare",
+     "region": "Punjab", "category": "Govt – Vacancies", "url": "https://health.punjab.gov.in/"},
+    {"id": "gmc_anantnag", "name": "GMC Anantnag (J&K)", "region": "Jammu & Kashmir",
+     "category": "Govt – Senior Resident", "url": "https://gmcanantnag.ac.in/"},
+    {"id": "sgpgims_lucknow", "name": "SGPGI Lucknow (SR / JR / Fellowship)",
+     "region": "Uttar Pradesh", "category": "Govt – Senior Resident",
+     "url": "https://sgpgims.org.in/Home/Recruitment.html"},
+    {"id": "gmc_thiruvananthapuram", "name": "GMC Thiruvananthapuram, Kerala",
+     "region": "Kerala", "category": "Govt – Senior Resident", "url": "https://gmc.edu.in/"},
+
 ]

@@ -83,6 +83,9 @@ def _state_from_region(region: str) -> str | None:
         "mumbai", "gujarat", "ahmedabad", "west bengal", "kolkata",
         "karnataka", "puducherry", "madhya pradesh", "rajasthan",
         "uttarakhand", "odisha", "private", "metro", "fellowship",
+        "uttar pradesh", "kerala", "jammu & kashmir", "assam",
+        "jharkhand", "chhattisgarh", "maharashtra", "telangana",
+        "andhra pradesh", "tamil nadu", "bihar", "goa",
     }
     # strip "/ INI" style suffixes
     first = r.split("/")[0].strip()
@@ -119,6 +122,20 @@ _CITY_STATE = {
     "new delhi": "Delhi",
     "delhi": "Delhi",
     "chandigarh": "Chandigarh",
+    # added with the all-India AIIMS/INI + state-portal sources
+    "raipur": "Chhattisgarh",
+    "nagpur": "Maharashtra",
+    "guwahati": "Assam",
+    "raebareli": "Uttar Pradesh",
+    "deoghar": "Jharkhand",
+    "anantnag": "Jammu & Kashmir",
+    "lucknow": "Uttar Pradesh",
+    "thiruvananthapuram": "Kerala",
+    "haldwani": "Uttarakhand",
+    "pithoragarh": "Uttarakhand",
+    "haridwar": "Uttarakhand",
+    "rudrapur": "Uttarakhand",
+    "almora": "Uttarakhand",
 }
 
 
@@ -212,28 +229,38 @@ def sync_opportunities_from_listings() -> dict:
 
     * New listing keys are INSERT-ed as opportunities (id == listing key).
     * Existing opportunities have their listing-mirrored fields refreshed.
+    * A ``SUPERSEDED`` opportunity whose listing reappeared is revived to
+      ``ACTIVE`` (the source came back). Explicit human lifecycle states
+      (CLOSED / CANCELLED / ARCHIVED) are never clobbered by the mirror.
     * No opportunity row is deleted here (historical data is never dropped
       by a mirror; removal is an explicit lifecycle transition).
-    Returns {inserted, updated, total}.
+    Returns {inserted, updated, revived, total}.
     """
     conn = db.get_conn()
     try:
         listings = conn.execute("SELECT * FROM listings").fetchall()
         inserted = 0
         updated = 0
+        revived = 0
         now = _now()
         for l in listings:
             d = dict(l)
             key = d["key"]
             exists = conn.execute(
-                "SELECT 1 FROM opportunities WHERE id=?", (key,)).fetchone()
+                "SELECT lifecycle_state FROM opportunities WHERE id=?", (key,)).fetchone()
             if exists:
+                was = (exists["lifecycle_state"] or "ACTIVE").upper()
+                if was == "SUPERSEDED":
+                    revived += 1
                 conn.execute(
                     """UPDATE opportunities SET
                          listing_key=?, source_id=?, source_name=?, region=?,
                          category=?, relevance=?, title=?, url=?, snippet=?,
                          notice_date=?, deadline=?, is_seed=?, starred=?,
-                         hidden=?, first_seen=?, last_seen=?, last_verified_at=?
+                         hidden=?, first_seen=?, last_seen=?, last_verified_at=?,
+                         lifecycle_state=CASE
+                           WHEN lifecycle_state='SUPERSEDED' THEN 'ACTIVE'
+                           ELSE lifecycle_state END
                        WHERE id=?""",
                     (key, d["source_id"], d["source_name"], d["region"],
                      d["category"], d["relevance"], d["title"], d["url"],
@@ -249,8 +276,9 @@ def sync_opportunities_from_listings() -> dict:
                        (id, listing_key, source_id, source_name, region,
                         category, relevance, title, url, snippet,
                         notice_date, deadline, is_seed, starred, hidden,
-                        first_seen, last_seen, discovered_at, last_verified_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        first_seen, last_seen, discovered_at, last_verified_at,
+                        lifecycle_state)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'ACTIVE')""",
                     (key, key, d["source_id"], d["source_name"], d["region"],
                      d["category"], d["relevance"], d["title"], d["url"],
                      d.get("snippet", ""), d.get("notice_date"), d.get("deadline"),
@@ -261,7 +289,80 @@ def sync_opportunities_from_listings() -> dict:
                 inserted += 1
         conn.commit()
         total = conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
-        return {"inserted": inserted, "updated": updated, "total": total}
+        return {"inserted": inserted, "updated": updated,
+                "revived": revived, "total": total}
+    finally:
+        conn.close()
+
+
+def count_orphan_opportunities() -> int:
+    """ACTIVE opportunities with no matching listing (projection drift)."""
+    conn = db.get_conn()
+    try:
+        return conn.execute(
+            """SELECT COUNT(*) FROM opportunities o
+               LEFT JOIN listings l ON l.key = o.id
+               WHERE l.key IS NULL
+                 AND COALESCE(o.lifecycle_state,'ACTIVE') <> 'SUPERSEDED'"""
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def reconcile_orphans(reason: str = "source_retention_prune") -> int:
+    """Supersede ACTIVE opportunities whose listing was pruned away.
+
+    A pruned listing means "no longer seen on its source page", which per
+    ARCHITECTURE.md is *not* a close. The row is retained and flipped to
+    ``SUPERSEDED`` so extracted eligibility data is never lost, and so the
+    ``opportunities == listings`` invariant holds for live (non-superseded)
+    rows. Returns the number of rows transitioned.
+    """
+    conn = db.get_conn()
+    try:
+        orphans = conn.execute(
+            """SELECT o.id, o.url, o.title, o.last_seen FROM opportunities o
+               LEFT JOIN listings l ON l.key = o.id
+               WHERE l.key IS NULL
+                 AND COALESCE(o.lifecycle_state,'ACTIVE') <> 'SUPERSEDED'"""
+        ).fetchall()
+        if not orphans:
+            return 0
+        now = _now()
+        for row in orphans:
+            conn.execute(
+                """UPDATE opportunities
+                   SET lifecycle_state='SUPERSEDED', last_verified_at=?
+                   WHERE id=?""",
+                (now, row["id"]),
+            )
+            record_event(
+                "SOURCE_RETENTION_PRUNE", row["id"],
+                {"reason": reason, "url": row["url"], "title": row["title"],
+                 "last_seen": row["last_seen"]},
+                conn=conn,
+            )
+        conn.commit()
+        return len(orphans)
+    finally:
+        conn.close()
+
+
+def verify_projection() -> dict:
+    """Invariants the live pipeline must uphold (mirrors migrations._verify)."""
+    conn = db.get_conn()
+    try:
+        q = lambda s: conn.execute(s).fetchone()[0]  # noqa: E731
+        n_list = q("SELECT COUNT(*) FROM listings")
+        n_opp = q("SELECT COUNT(*) FROM opportunities")
+        n_live = q("""SELECT COUNT(*) FROM opportunities
+                       WHERE COALESCE(lifecycle_state,'ACTIVE') <> 'SUPERSEDED'""")
+        n_orphans = count_orphan_opportunities()
+        n_doc = q("SELECT COUNT(*) FROM documents")
+        return {"listings": n_list, "opportunities": n_opp,
+                "live_opportunities": n_live, "orphans": n_orphans,
+                "documents": n_doc,
+                "ok": n_orphans == 0 and n_list == n_live and 0 <= n_doc <= n_list}
     finally:
         conn.close()
 
@@ -373,14 +474,19 @@ def fetch_documents(opportunity_id: str | None = None) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def record_event(event_type: str, opportunity_id: str | None,
-                 payload: dict | None = None, idempotency_hash: str | None = None) -> str:
-    """Insert an event; idempotent on idempotency_hash when provided."""
+                 payload: dict | None = None, idempotency_hash: str | None = None,
+                 conn=None) -> str:
+    """Insert an event; idempotent on idempotency_hash when provided.
+
+    Pass ``conn`` to enlist in a caller-owned transaction (no commit here).
+    """
     payload = payload or {}
     idem = idempotency_hash or hashlib.sha1(
         f"{event_type}|{opportunity_id}|{_jdump(payload)}".encode("utf-8")).hexdigest()
     event_id = hashlib.sha1(
         f"{idem}|{_now()}".encode("utf-8")).hexdigest()
-    conn = db.get_conn()
+    own = conn is None
+    conn = conn or db.get_conn()
     try:
         if idempotency_hash:
             exists = conn.execute(
@@ -392,10 +498,12 @@ def record_event(event_type: str, opportunity_id: str | None,
                (event_id, event_type, opportunity_id, occurred_at, payload, idempotency_hash)
                VALUES (?,?,?,?,?,?)""",
             (event_id, event_type, opportunity_id, _now(), _jdump(payload), idem))
-        conn.commit()
+        if own:
+            conn.commit()
         return event_id
     finally:
-        conn.close()
+        if own:
+            conn.close()
 
 
 def fetch_events(opportunity_id: str | None = None) -> list[dict]:

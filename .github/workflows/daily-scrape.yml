@@ -1,6 +1,15 @@
 name: Daily pathology scrape
 
 on:
+  push:
+    # Only the default branch publishes. `branches: ["**"]` used to run the
+    # full network scrape and push bot commits onto every contributor branch.
+    branches: ["main"]
+  # Pull requests run the `test` gate only. They deliberately do NOT publish:
+  # actions/checkout leaves a PR checkout in DETACHED HEAD, where the
+  # `git push` below fails with "fatal: You are not currently on a branch",
+  # so every PR used to show a red scrape job.
+  pull_request:
   schedule:
     # 08:00 IST = 02:30 UTC daily
     - cron: "30 2 * * *"
@@ -9,8 +18,43 @@ on:
 permissions:
   contents: write
 
+# Never let two scrapes race for the same cached DB / git push.
+concurrency:
+  group: pathology-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  # ── Gate ──────────────────────────────────────────────────────────────────
+  # The unit suite (215 tests, ~16s, hermetic: tmp_path DBs, no network, no
+  # browser) is the contract for the pipeline below. It used to never run in CI
+  # at all, so a regression could ship straight into the published mirror.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile every module
+        run: python -m compileall -q app.py scraper.py db.py repository.py migrations.py config.py alerts.py sources.py export_static.py seed.py
+
+      - name: Run unit tests
+        run: python -m pytest tests/ -q
+
+  # ── Publish ───────────────────────────────────────────────────────────────
   scrape:
+    needs: test
+    # Never publish from a pull request (detached HEAD -> `git push` fails).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -44,6 +88,22 @@ jobs:
           ls -lh public/data.json || echo "no data.json"
           python_count=$(python -c "import json; print(len(json.load(open('public/data.json'))['listings']))")
           echo "listings=$python_count" >> $GITHUB_ENV
+
+      - name: Verify data integrity before publishing
+        # The opportunity-first projection is only useful if it stays in sync
+        # with `listings`. Fail the run rather than publish a drifting mirror.
+        run: |
+          python - <<'PY'
+          import json, sys
+          import db, repository
+          db.init_db()
+          p = repository.verify_projection()
+          print(json.dumps(p, indent=2))
+          db.set_meta("last_run_projection", json.dumps(p))
+          if not p["ok"]:
+              print("::error::projection invariant violated — refusing to publish")
+              sys.exit(1)
+          PY
 
       - name: Commit updated static mirror
         run: |

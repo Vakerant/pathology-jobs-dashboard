@@ -79,6 +79,12 @@ SCRAPE_TIMEOUT = (_env_int("SCRAPE_CONNECT_TIMEOUT", 10), _env_int("SCRAPE_READ_
 MAX_WORKERS = _env_int("MAX_WORKERS", 10)
 MAX_ITEMS_PER_SOURCE = _env_int("MAX_ITEMS_PER_SOURCE", 60)
 AUTO_SCRAPE_HOURS = _env_int("AUTO_SCRAPE_HOURS", 6)
+# Master switch for the background auto-scrape loop in app.py. It is on by
+# default because a long-lived dashboard should keep itself fresh, but it MUST
+# be switchable: the loop opens outbound network connections and writes to the
+# database as soon as `app` is imported, which makes any test run (or one-off
+# REPL session) non-hermetic. conftest.py sets this to 0 for pytest.
+AUTO_SCRAPE_ENABLED = _env_bool("AUTO_SCRAPE_ENABLED", True)
 # Hosts that genuinely need TLS verify disabled (broken cert chains).
 #
 # Several govt/INI sites serve an INCOMPLETE TLS cert chain (they omit their
@@ -89,6 +95,13 @@ AUTO_SCRAPE_HOURS = _env_int("AUTO_SCRAPE_HOURS", 6)
 _DEFAULT_INSECURE_HOSTS = [
     "pgimer.edu.in", "jipmer.edu.in", "nimhans.ac.in",
     "uhsr.ac.in", "aimsschamiana.edu.in",
+    # www.icmr.gov.in omits its intermediate CA -> CERTIFICATE_VERIFY_FAILED.
+    # Served over HTTPS with verify=False rather than downgraded to plain http.
+    "icmr.gov.in",
+    # RML Hospital: rmlh.nic.in redirects to rmlh.mohfw.gov.in, and it is the
+    # redirect TARGET that serves the incomplete chain. Both hosts are listed
+    # because verification is decided per requested URL, including redirects.
+    "rmlh.nic.in", "rmlh.mohfw.gov.in",
 ]
 INSECURE_HOSTS = set(_env_list("PATHO_INSECURE_HOSTS", _DEFAULT_INSECURE_HOSTS))
 

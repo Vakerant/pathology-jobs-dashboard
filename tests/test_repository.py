@@ -31,10 +31,11 @@ def _listing(repo, key="k1", source_id="src1", title="Senior Resident Pathology 
     conn = repo.get_conn()
     conn.execute(
         """INSERT INTO listings
-           (key, source_id, source_name, region, category, title, url, relevance)
-           VALUES (?,?,?,?,?,?,?,?)""",
+           (key, source_id, source_name, region, category, title, url, relevance,
+            first_seen, last_seen)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (key, source_id, "Test Hospital", "Delhi", "Govt – Senior Resident",
-         title, f"https://example.com/{key}", "high"))
+         title, f"https://example.com/{key}", "high", "2026-01-01", "2026-02-02"))
     conn.commit()
     conn.close()
 
@@ -126,3 +127,115 @@ def test_institutions_populated_from_sources(repo):
     # one institution per source id
     ids = {s for i in insts for s in i["sources"]}
     assert len(ids) == n
+
+
+# ── Projection invariant: listings == live opportunities, zero orphans ───────
+# `scraper.run()` now syncs the opportunity-first projection on every pass.
+# These tests pin the contract that keeps ARCHITECTURE.md §4 honest.
+
+
+def test_sync_revives_superseded_opportunity(repo):
+    """A source page that reappears must revive its SUPERSEDED row."""
+    _listing(repo, "k1")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("DELETE FROM listings WHERE key='k1'")
+    conn.commit(); conn.close()
+
+    assert r.reconcile_orphans() == 1
+    assert r.get_opportunity("k1")["lifecycle_state"] == "SUPERSEDED"
+    assert r.count_orphan_opportunities() == 0  # superseded != orphan
+
+    _listing(repo, "k1")
+    result = r.sync_opportunities_from_listings()
+    assert result["revived"] == 1
+    assert r.get_opportunity("k1")["lifecycle_state"] == "ACTIVE"
+
+
+def test_sync_does_not_clobber_human_lifecycle_state(repo):
+    """Explicit human decisions (CLOSED/CANCELLED/ARCHIVED) must survive re-sync."""
+    _listing(repo, "k1")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("UPDATE opportunities SET lifecycle_state='CLOSED' WHERE id='k1'")
+    conn.commit(); conn.close()
+
+    r.sync_opportunities_from_listings()
+    assert r.get_opportunity("k1")["lifecycle_state"] == "CLOSED"
+
+
+def test_reconcile_orphans_supersedes_and_records_event(repo):
+    _listing(repo, "k1")
+    _listing(repo, "k2")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("DELETE FROM listings WHERE key='k2'")
+    conn.commit(); conn.close()
+
+    assert r.reconcile_orphans() == 1
+    assert r.reconcile_orphans() == 0  # idempotent
+    events = r.fetch_events()
+    assert [e["event_type"] for e in events] == ["SOURCE_RETENTION_PRUNE"]
+    assert events[0]["opportunity_id"] == "k2"
+    assert r.verify_projection()["ok"] is True
+
+
+def test_reconcile_orphans_enriches_event_payload(repo):
+    _listing(repo, "k1", title="Fellowship Surgical Pathology")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("DELETE FROM listings WHERE key='k1'")
+    conn.commit(); conn.close()
+
+    r.reconcile_orphans(reason="retention_test")
+    payload = r.fetch_events()[0]["payload"]  # fetch_events parses JSON for us
+    assert payload["reason"] == "retention_test"
+    assert payload["url"] == "https://example.com/k1"
+    assert payload["title"] == "Fellowship Surgical Pathology"
+    assert payload["last_seen"]
+
+
+def test_verify_projection_ok_when_in_sync(repo):
+    _listing(repo, "k1")
+    r.sync_opportunities_from_listings()
+    p = r.verify_projection()
+    assert p == {"listings": 1, "opportunities": 1, "live_opportunities": 1,
+                 "orphans": 0, "documents": 0, "ok": True}
+
+
+def test_verify_projection_flags_drift(repo):
+    """An orphan that was never reconciled must fail the gate."""
+    _listing(repo, "k1")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("DELETE FROM listings WHERE key='k1'")
+    conn.commit(); conn.close()
+
+    p = r.verify_projection()
+    assert p["orphans"] == 1
+    assert p["live_opportunities"] == 1
+    assert p["ok"] is False
+
+
+def test_record_event_enlists_in_caller_transaction(repo):
+    """Passing conn= must defer the commit to the caller so both writes roll back."""
+    _listing(repo, "k1")
+    r.sync_opportunities_from_listings()
+    conn = repo.get_conn()
+    conn.execute("DELETE FROM listings WHERE key='k1'")
+    conn.commit()
+
+    conn.execute("BEGIN")
+    conn.execute("UPDATE opportunities SET lifecycle_state='SUPERSEDED' WHERE id='k1'")
+    r.record_event("TEST_EVENT", "k1", {"x": 1}, conn=conn)
+    conn.rollback()
+    conn.close()
+
+    assert r.get_opportunity("k1")["lifecycle_state"] == "ACTIVE"
+    assert r.fetch_events() == []
+
+
+def test_record_event_owns_transaction_when_no_conn(repo):
+    """Without conn=, record_event must commit on its own as before."""
+    r.record_event("OWN_EVENT", "k1", {"x": 1}, idempotency_hash="own1")
+    assert [e["event_type"] for e in r.fetch_events()] == ["OWN_EVENT"]

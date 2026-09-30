@@ -1,6 +1,5 @@
 """SQLite storage layer for the pathology-jobs dashboard."""
 import sqlite3
-import os
 import re
 import hashlib
 from datetime import datetime, timezone, timedelta, date

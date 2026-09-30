@@ -61,8 +61,77 @@ Until you do this, alerts are simply skipped (everything else still runs).
 3. **↻ Update now** — on-demand from the dashboard.
 
 The pipeline: seed → scrape (parallel, with retries) → email new pathology posts →
-prune stale listings → rebuild static → redeploy to Vercel. Logs go to `scrape.log`
-(auto-trimmed). The UI shows a ⚠️ banner whenever data is older than 24 h.
+prune stale listings → **re-sync the opportunity projection** → rebuild static →
+redeploy to Vercel. Logs go to `scrape.log` (auto-trimmed). The UI shows a ⚠️
+banner whenever data is older than 24 h.
+
+## Scraping feedback
+
+`↻ Update now` is **POST** `/api/refresh` and takes ~1 minute. The button
+shows live elapsed time while it runs, then reports what the scrape actually
+did: how many listings were new, total, and how many sources were OK vs
+failed. Those counters come from `/api/data` `stats` (`last_run_new`,
+`last_run_ok`, `last_run_failed`, `projection_ok`, `orphans`). If a scrape
+crashes, the UI says so within 3 minutes instead of spinning forever.
+
+Most refreshes legitimately add **0–2** new listings — if the list looks
+unchanged that is usually the honest result, not a failure. Source health
+(the live panel) is the real signal.
+
+## Finding notices on linked documents
+
+Some institutions do not publish a notice on their homepage. AIIMS Jodhpur is
+the clearest example: the home page links to a rolling
+`residents-rec.php` page, that page links to the actual Senior Resident
+advertisement as a bare **"View Document"** anchor, and the PDF lives on a
+*different host* (`rec.aiimsjodhpur.edu.in`). The word "Pathology" appears only
+inside the PDF's department table — nowhere in any link text or URL.
+
+`scraper.py` therefore adds a narrow **document-discovery** layer:
+
+1. After the homepage, it follows up to 3 same-site index pages whose link text
+   or href looks like a recruitment/notice page. Same-site is judged on the
+   *registrable* domain, so `rec.aiimsjodhpur.edu.in` is reachable from
+   `aiimsjodhpur.edu.in` but `pmssy.mohfw.gov.in` is not.
+2. It downloads up to 12 linked PDFs (12 MB / 8 page cap each), extracts the
+   text, and if the body mentions a pathology department it **promotes the
+   listing to `high` relevance**, replaces the "View Document" title with the
+   notice's real `Subject:` line, and fills the snippet, deadline and document
+   type from the body. It only ever adds signal — never demotes.
+3. Because the departmental vacancy table is what a pathologist needs, the
+   snippet is the line around the pathology keyword, e.g.
+   `Pathology & Lab Medicine MD/DNB in Pathology 1 1 0 0 0 2`.
+
+Requires `pypdf` (in `requirements.txt`). Without it the scraper degrades to
+the previous homepage-only behaviour rather than failing. Two supporting
+changes make this work: `JUNK_TITLES` gained the `view document` family so the
+stub never reaches the card, and `_candidates` exempts PDF targets from that
+junk filter — otherwise the one link worth following is the one link dropped.
+
+## Tests & CI
+`./venv/bin/python -m pytest tests/ -q` — 215 tests, no network, ~16 s.
+
+`.github/workflows/daily-scrape.yml` runs a `test` job (compile + pytest) that the
+scheduled `scrape` job depends on, so a failing test blocks the publish instead
+of shipping a bad static mirror. The scrape job also re-verifies the
+opportunity/listing projection invariant and fails the build rather than
+committing drifting data — see ARCHITECTURE.md §4.
+
+`tests/test_dashboard_ui.py` is the UI gate. It parses `templates/dashboard.html`
+and asserts the design contract that is invisible at runtime: every CSS custom
+property is defined and used, WCAG AA contrast recomputed from the `:root`
+values, no duplicate element ids, one `<h1>` and correct heading order, source
+failures rendered in the page rather than hidden behind a `title=` tooltip, and
+the card animation gated to first paint. Where a function is pure, the real
+source is extracted and executed under `node`, so `safeUrl`, `esc`, `cleanErr`,
+`tierOf`, `daysUntil` and `scrapeSummary` are tested on their actual bodies
+rather than on a copy. `node` is optional — those tests skip without it.
+
+`tests/test_document_discovery.py` guards the document-discovery layer
+offline: the site-scope and index-following logic, the PDF body extractors
+(subject, deadline, pathology sentence) against a reduced fixture of the real
+AIIMS Jodhpur advertisement, the link-furniture trimmer, and the "only ever add
+signal, never demote" promotion policy.
 
 ## Dashboard tips
 - **Pathology only** filter (relevance = high) = items that actually name

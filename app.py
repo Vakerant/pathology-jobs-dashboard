@@ -5,8 +5,6 @@
 - TLS verification is fixed in scraper.py; this service just serves.
 """
 import logging
-import os
-import re
 import threading
 from datetime import datetime, timezone, timedelta
 
@@ -16,6 +14,7 @@ import db
 import scraper
 import alerts
 import export_static
+import config
 
 # ---------------------------------------------------------------------------
 # App & infra
@@ -29,17 +28,30 @@ log = logging.getLogger("pathology-dashboard")
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024  # flag payload is tiny
 
+# _scrape_lock guards ONLY the atomic claim of the scrape slot. The scrape
+# itself must NOT hold it, or a slow scrape would block every other caller
+# for its whole duration instead of being idempotently rejected.
 _scrape_lock = threading.Lock()
 _scraping = {"running": False}
 _auto_loop_started = False
+# Held open for the process lifetime by whichever process wins the auto-scrape
+# lock; see _ensure_auto_loop.
+_auto_loop_lock_fh = None
 
 # Auto-update: while the dashboard runs, re-scrape whenever data gets older
 # than this (covers laptops that are asleep when the daily timer fires).
-AUTO_SCRAPE_HOURS = 6
+# Single source of truth: config.py (env-overridable, see .env.example).
+AUTO_SCRAPE_HOURS = config.AUTO_SCRAPE_HOURS
+# How often the auto-scrape loop wakes up to re-check staleness.
+AUTO_SCRAPE_POLL_SECONDS = 900
+# Set on shutdown so the auto loop can exit promptly instead of sleeping out
+# its full poll interval. A throwaway Event per iteration can never be
+# signalled, which previously made graceful shutdown impossible.
+_shutdown = threading.Event()
 
 # Flag allowlist — never interpolate user input into SQL without this.
 ALLOWED_FLAG_FIELDS = {"starred", "hidden"}
-_KEY_RE = re.compile(r"^[0-9a-f]{40}$")
+_KEY_RE = config.FLAG_KEY_RE
 
 
 def _validate_env():
@@ -100,7 +112,15 @@ def api_data():
         "sources_ok": sum(1 for s in status if s["status"] == "ok"),
         "sources_failed": sum(1 for s in status if s["status"] == "failed"),
         "last_run": db.get_meta("last_run"),
-        "scraping": _scraping["running"],
+        "scraping": _is_scraping(),
+        # What the most recent scrape actually did. Without these the UI can only
+        # say "updating..." and then go quiet, which is indistinguishable from a
+        # silent failure — see the toast in templates/dashboard.html::refresh().
+        "last_run_new": _meta_int("last_run_new"),
+        "last_run_ok": _meta_int("last_run_ok"),
+        "last_run_failed": _meta_int("last_run_failed"),
+        "projection_ok": db.get_meta("last_run_projection_ok") == "1",
+        "orphans": _meta_int("last_run_orphans"),
     }
     return jsonify({"listings": listings, "status": status, "stats": stats})
 
@@ -122,28 +142,56 @@ def _do_scrape():
     except Exception as exc:  # noqa: BLE001
         log.exception("scrape run failed: %s", exc)
     finally:
-        _scraping["running"] = False
+        # Release the slot under the lock so a claim can never interleave
+        # with the clear and observe a stale True.
+        with _scrape_lock:
+            _scraping["running"] = False
 
 
-def _start_scrape():
-    """Kick off a scrape unless one is already running. Returns True if started."""
-    if _scrape_lock.acquire(blocking=False):
-        try:
-            if not _scraping["running"]:
-                _scraping["running"] = True
-                log.info("starting scrape")
-                threading.Thread(target=_do_scrape, daemon=True).start()
-                return True
+def _is_scraping() -> bool:
+    with _scrape_lock:
+        return bool(_scraping["running"])
+
+
+def _meta_int(key: str) -> int:
+    """Read an integer out of the meta table, tolerating missing/garbage values.
+
+    meta rows are written as TEXT by db.set_meta and may be absent entirely on a
+    fresh database, so every caller here wants a number, never an exception.
+    """
+    try:
+        return int(db.get_meta(key) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _start_scrape() -> bool:
+    """Kick off a scrape unless one is already running. Returns True if started.
+
+    The claim is a check-and-set performed *while holding* ``_scrape_lock``,
+    which is what makes concurrent /api/refresh calls safe. Previously the
+    lock was released before the spawned thread did any work, so the real
+    guard was a lock-free check-then-set on the ``_scraping`` dict and two
+    callers could both pass it and launch overlapping scrapes.
+    """
+    with _scrape_lock:
+        if _scraping["running"]:
             log.info("scrape already running — skip")
             return False
-        finally:
-            _scrape_lock.release()
-    return False
+        _scraping["running"] = True
+    # Start outside the lock: the scrape outlives the claim by design.
+    log.info("starting scrape")
+    threading.Thread(target=_do_scrape, name="scrape", daemon=True).start()
+    return True
 
 
 def _auto_scrape_loop():
-    """Every 15 min: scrape if the data is stale. Runs as a daemon thread."""
-    while True:
+    """Every AUTO_SCRAPE_POLL_SECONDS: scrape if the data is stale.
+
+    Runs as a daemon thread and wakes on ``_shutdown`` so it can exit
+    promptly on SIGTERM instead of sleeping out a full poll interval.
+    """
+    while not _shutdown.is_set():
         try:
             last = db.get_meta("last_run")
             stale = (not last or
@@ -153,23 +201,80 @@ def _auto_scrape_loop():
                 _start_scrape()
         except Exception as exc:  # noqa: BLE001
             log.warning("auto_scrape_loop error: %s", exc)
-        threading.Event().wait(900)
+        _shutdown.wait(AUTO_SCRAPE_POLL_SECONDS)
+    log.info("auto-scrape loop stopped")
 
 
 def _ensure_auto_loop():
-    global _auto_loop_started
+    """Start the background auto-scrape loop, at most once per *host*.
+
+    ``_scrape_lock`` and ``_scraping`` are per-process, so an in-process guard
+    is not enough: the systemd unit runs ``gunicorn --workers 2`` without
+    ``--preload``, which means every worker imports this module independently.
+    Each would start its own loop, and once the data went stale both would
+    fire a scrape against the same SQLite file — duplicated work, duplicated
+    email alerts, and write contention.
+
+    An exclusive advisory lock on a lockfile elects a single owner. The first
+    worker to claim it runs the loop and keeps the fd open for the life of the
+    process; the losers skip and leave the loop to the winner.
+    """
+    global _auto_loop_started, _auto_loop_lock_fh
     if _auto_loop_started:
         return
+    try:
+        import fcntl
+        fh = open(str(config.DB_PATH) + ".auto-scrape.lock", "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            log.info("auto-scrape loop owned by another process — skipping")
+            return
+        # Keep the handle referenced: closing it would release the lock.
+        _auto_loop_lock_fh = fh
+    except Exception as exc:  # noqa: BLE001
+        # Locking unavailable (exotic filesystem, no fcntl) — degrade to the
+        # per-process guard: one loop per worker beats no loop at all.
+        log.warning("auto-scrape lock unavailable (%s) — per-process guard only",
+                    exc)
+
     _auto_loop_started = True
-    threading.Thread(target=_auto_scrape_loop, daemon=True).start()
-    log.info("auto-scrape loop started (every 15 min, stale=%sh)", AUTO_SCRAPE_HOURS)
+    threading.Thread(target=_auto_scrape_loop, name="auto-scrape",
+                     daemon=True).start()
+    log.info("auto-scrape loop started (every %ss, stale=%sh)",
+             AUTO_SCRAPE_POLL_SECONDS, AUTO_SCRAPE_HOURS)
+
+
+def _install_signal_handlers():
+    """Flip _shutdown on SIGTERM/SIGINT so the auto loop drains cleanly.
+
+    Only ever called from the ``__main__`` path. Under a WSGI server this must
+    NOT run: gunicorn imports the app in each worker's main thread, so
+    ``signal.signal`` would *succeed* and silently replace gunicorn's own
+    SIGTERM/SIGINT handlers with a handler that only sets a flag. The worker
+    would then ignore the signal that gunicorn relies on for graceful exit and
+    hang until SIGKILL, breaking ``systemctl restart``.
+    """
+    import signal
+
+    def _handle(signum, _frame):
+        log.info("received signal %s — shutting down", signum)
+        _shutdown.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            signal.signal(sig, _handle)
+        except (ValueError, OSError):
+            # Not on the main thread — the daemon thread is torn down at exit.
+            log.debug("could not install handler for %s", sig)
 
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     started = _start_scrape()
     # 202 if we started, 200 if already running — both succeed but caller knows
-    return jsonify({"started": started, "running": _scraping["running"]}), (202 if started else 200)
+    return jsonify({"started": started, "running": _is_scraping()}), (202 if started else 200)
 
 
 @app.route("/api/flag", methods=["POST"])
@@ -210,9 +315,18 @@ def api_flag():
 # Startup — works for both `python app.py` and `gunicorn app:app`
 # ---------------------------------------------------------------------------
 _validate_env()
-_ensure_auto_loop()
+if config.AUTO_SCRAPE_ENABLED:
+    _ensure_auto_loop()
+else:
+    # Importing this module must never start outbound network traffic on its
+    # own: tests import `app`, and an unguarded loop turned a `pytest` run into
+    # a live scrape of every configured source.
+    log.info("auto-scrape loop disabled (AUTO_SCRAPE_ENABLED=0)")
 
 if __name__ == "__main__":
     # Direct run (systemd ExecStart with `python app.py` still works)
     # Host/port are intentionally localhost; expose via reverse proxy in prod.
+    # Signal handlers are installed here rather than at import: under gunicorn
+    # this block never runs, so we never clobber gunicorn's own handlers.
+    _install_signal_handlers()
     app.run(host="127.0.0.1", port=5000, debug=False)
