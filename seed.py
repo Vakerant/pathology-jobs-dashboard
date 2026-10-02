@@ -128,24 +128,15 @@ SEEDS = [
      "title": "DrNB / FNB super-specialty pathology fellowships (NBE accredited)",
      "url": "https://natboard.edu.in/",
      "snippet": "NBE accredits DrNB/FNB fellowships (e.g. Hemato-pathology, Molecular). Stipend paid by host hospital. Apply via NBE counselling cycles."},
-
-    # ---- Private chains ----
-    {"source_id": "lalpathlabs", "source_name": "Dr Lal PathLabs", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "relevance": "high",
-     "title": "Consultant Pathologist – Dr Lal PathLabs (multiple cities)",
-     "url": "https://www.lalpathlabs.com/career/job-opening/consultant-pathologist",
-     "snippet": "Consultant Pathologist roles across Delhi-NCR and other metros. Typical consultant pay band ₹15–35 LPA in the diagnostics sector."},
-    {"source_id": "metropolis", "source_name": "Metropolis Healthcare", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "relevance": "high",
-     "title": "Consultant Pathologist – Metropolis Healthcare (Mumbai & pan-India)",
-     "url": "https://www.metropolisindia.com/careers",
-     "snippet": "Consultant Pathologist openings (Mumbai HQ + regional labs). MD Pathology, 0–5 yrs. Also reporting/region-pathologist roles."},
-    {"source_id": "agilus", "source_name": "Agilus Diagnostics (SRL)", "region": "Private / Metro",
-     "category": "Private – Consultant Pathologist", "relevance": "high",
-     "title": "Consultant / Reporting Pathologist – Agilus (SRL) Diagnostics",
-     "url": "https://www.agilus.in/careers",
-     "snippet": "Pan-India diagnostic chain; consultant & reporting pathologist roles, histopath/cytopath."},
 ]
+# NOTE: the private diagnostic chains (Dr Lal PathLabs, Metropolis, Agilus/SRL)
+# used to be seeded here. They were removed on purpose -- this tracker is for
+# MD (Human) Pathology posts in govt/INI institutions, and a diagnostic chain's
+# "Consultant Pathologist" is a different market with different pay bands.
+# Leaving them in SEEDS was actively harmful: run_daily.sh runs seed.py before
+# every scrape, so they were resurrected into the DB on every single pipeline
+# run even though the scraper had stopped tracking them. tests/test_seed_alignment.py
+# locks the invariant that every seeded source_id must still exist in sources.SOURCES.
 
 
 def run():

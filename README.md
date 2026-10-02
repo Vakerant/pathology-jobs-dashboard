@@ -2,10 +2,11 @@
 
 A self-updating dashboard that watches official recruitment/career pages for
 **Senior Resident exams, pathology jobs, and paid fellowships** across
-HP · Punjab · Haryana · Chandigarh · Delhi · the INIs (AIIMS network, PGIMER,
-JIPMER, NIMHANS) · top metros (Mumbai, Ahmedabad) · and private chains
-(Dr Lal, Metropolis, Agilus). Built for your MD Pathology job hunt (degree
-completes 7 Oct 2026).
+HP · Punjab · Haryana · Chandigarh · Delhi · Uttarakhand · Kerala · J&K · UP ·
+the INIs (AIIMS network, PGIMER, JIPMER, NIMHANS) · top metros (Mumbai,
+Ahmedabad) · and paid fellowships. MD (Human) Pathology only — dental, oral
+and veterinary notices are filtered out at scrape time. Built for your MD
+Pathology job hunt (degree completes 7 Oct 2026).
 
 ## Open it in Chrome
 The dashboard now runs as a background service — just visit **http://localhost:5000**.
@@ -17,12 +18,15 @@ systemctl --user restart pathology-dashboard.service   # restart after code edit
 (Manual fallback: `cd ~/pathology-jobs-dashboard && ./venv/bin/python app.py`.)
 
 ## How it works
-- **`sources.py`** – the ~34 official pages that get polled. Add/remove freely.
+- **`sources.py`** – the 45 official pages that get polled. Add/remove freely.
 - **`scraper.py`** – fetches each page, keeps anything mentioning pathology /
   senior resident / fellowship / recruitment. Each source is isolated, so one
   dead site never breaks the run. Stores into `data.db` (SQLite).
-- **`seed.py`** – 24 hand-verified opportunities (with pay & eligibility notes)
-  so the board is useful immediately and covers bot-blocked sites.
+- **`seed.py`** – 21 hand-verified opportunities (with pay & eligibility notes)
+  so the board is useful immediately and covers bot-blocked sites. Every seeded
+  `source_id` must also exist in `sources.SOURCES`, or the seed silently
+  resurrects a retired source on the next daily run
+  (`tests/test_seed_alignment.py`).
 - **`app.py`** – Flask dashboard + JSON API (`/api/data`, `/api/refresh`, `/api/flag`).
 - **`templates/dashboard.html`** – the UI: region/category filters, full-text
   search, "New 7d" + relevance toggles, ⭐ star and ✕ hide, live source-health panel.
@@ -109,7 +113,7 @@ stub never reaches the card, and `_candidates` exempts PDF targets from that
 junk filter — otherwise the one link worth following is the one link dropped.
 
 ## Tests & CI
-`./venv/bin/python -m pytest tests/ -q` — 215 tests, no network, ~16 s.
+`./venv/bin/python -m pytest tests/ -q` — 271 tests, no network, ~14 s.
 
 `.github/workflows/daily-scrape.yml` runs a `test` job (compile + pytest) that the
 scheduled `scrape` job depends on, so a failing test blocks the publish instead
@@ -143,9 +147,11 @@ signal, never demote" promotion policy.
 
 ## Known bot-blocked sources (covered by verified seed cards instead)
 BFUHS Faridkot (WAF, 403 to all scripts). Its seed card carries the correct apply
-link — open and check the live notice. UHS Rohtak and Agilus were fixed by
-pointing at their new URLs; flaky govt sites (PGIMER, tmc.gov.in) are handled
-with automatic retries.
+link — open and check the live notice. The National Board (natboard) is likewise
+WAF-blocked from this host (HTTP 403 on both http and https), so its stored
+cards drift stale — open the card to check the live notice. UHS Rohtak was
+fixed by pointing at its new URL; flaky govt sites (PGIMER, tmc.gov.in) are
+handled with automatic retries.
 
 ## Add a new source
 Append a dict to `SOURCES` in `sources.py`:
