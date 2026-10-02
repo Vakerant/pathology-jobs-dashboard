@@ -186,6 +186,70 @@ def test_run_history_survives_a_crashed_run(tmp_path, monkeypatch):
     assert row["finished_at"] is None, "an unfinished run must not claim a finish time"
 
 
+def test_a_new_run_closes_out_the_previous_unfinished_run(tmp_path, monkeypatch):
+    """'running' has to keep meaning 'in flight right now'.
+
+    Writing the start row up front (above) is what makes a killed run visible
+    at all -- but it also means a killed run's row sits at 'running' forever,
+    because `record_run_finish` is never reached. Three such rows had
+    accumulated in the live DB and were indistinguishable from a live run.
+
+    Only one scrape is meaningfully in flight at a time, so any 'running' row
+    present when a new run opens is by definition dead and must be closed out
+    rather than left to rot.
+    """
+    import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "interrupt.db"))
+    db.init_db()
+
+    db.record_run_start("run-dead-1", "2026-10-01T00:00:00+00:00", 48)
+    db.record_run_start("run-dead-2", "2026-10-01T01:00:00+00:00", 48)
+    # never finished -- both are stranded, as a SIGTERM'd run would leave them
+
+    db.record_run_start("run-live", "2026-10-02T00:00:00+00:00", 48)
+
+    conn = db.get_conn()
+    rows = {
+        r["run_id"]: (r["status"], r["finished_at"])
+        for r in conn.execute("SELECT run_id, status, finished_at FROM scrape_runs")
+    }
+    conn.close()
+
+    assert rows["run-dead-1"][0] == "interrupted", rows
+    assert rows["run-dead-2"][0] == "interrupted", rows
+    # finished_at is the moment the *next* run detected the corpse -- the time
+    # it was found, not a time the dead run ever reached. Each is stamped by
+    # the run that found it, so the two must differ.
+    assert rows["run-dead-1"][1] == "2026-10-01T01:00:00+00:00", rows
+    assert rows["run-dead-2"][1] == "2026-10-02T00:00:00+00:00", rows
+    # and the new run is the only thing claiming to be live
+    assert rows["run-live"] == ("running", None), rows
+
+
+def test_restarting_the_same_run_id_is_not_self_interrupted(tmp_path, monkeypatch):
+    """Guard on the `run_id<>?` clause.
+
+    `record_run_start` uses INSERT OR REPLACE, so re-opening the same id is a
+    legitimate no-op-ish call. The sweep must not close out the row it is
+    about to write.
+    """
+    import db
+
+    monkeypatch.setattr(db, "DB_PATH", str(tmp_path / "same.db"))
+    db.init_db()
+
+    db.record_run_start("run-x", "2026-10-01T00:00:00+00:00", 48)
+    db.record_run_start("run-x", "2026-10-01T00:00:05+00:00", 48)
+
+    conn = db.get_conn()
+    # NB: get_conn() sets row_factory=sqlite3.Row, so rows are not tuples.
+    rows = [tuple(r) for r in conn.execute("SELECT run_id, status FROM scrape_runs")]
+    conn.close()
+
+    assert rows == [("run-x", "running")], rows
+
+
 def test_one_raising_source_cannot_abort_the_run(tmp_path, monkeypatch):
     """A source that raises must not kill the other 47 or strand the run row.
 

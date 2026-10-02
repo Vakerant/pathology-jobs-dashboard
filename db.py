@@ -280,8 +280,22 @@ def record_status(source_id, source_name, region, status, http_status, items_fou
 
 def record_run_start(run_id, started_at, total_sources):
     """Open a `scrape_runs` row. Written BEFORE any network work so a run that
-    is killed or crashes still leaves a 'running' row behind."""
+    is killed or crashes still leaves a 'running' row behind.
+
+    Writing that trace is only useful if 'running' reliably means "in flight
+    right now". A run that is SIGTERM'd (systemd timeout, manual stop) or that
+    dies with its parent never reaches record_run_finish, so its row would sit
+    at 'running' forever and become indistinguishable from a live run. Since
+    only one scrape can meaningfully be in flight at a time, any pre-existing
+    'running' row at the moment a new run starts is by definition dead, and is
+    closed out as 'interrupted' rather than left to rot.
+    """
     conn = get_conn()
+    conn.execute(
+        "UPDATE scrape_runs SET status='interrupted', finished_at=?"
+        " WHERE status='running' AND run_id<>?",
+        (started_at, run_id),
+    )
     conn.execute(
         "INSERT OR REPLACE INTO scrape_runs (run_id, started_at, status, total_sources)"
         " VALUES (?,?,'running',?)",
