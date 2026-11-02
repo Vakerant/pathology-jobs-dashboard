@@ -3,7 +3,7 @@
 # NOT cron -- `crontab -l` is empty on purpose). Logs to scrape.log.
 #   1. refresh verified seeds        2. scrape live notices
 #   3. email alert for NEW pathology 4. rebuild static site
-#   5. redeploy mirror to Vercel (mobile)
+#   5. (the live site is deployed by Vercel from GitHub, not from here)
 #
 # Exit status is non-zero if ANY step failed, so the systemd unit reports a
 # failed run instead of silently claiming success. Previously every step ran
@@ -46,17 +46,9 @@ run_step() {
   run_step "alerts"      "$PY" alerts.py            # emails only genuinely-new pathology posts
   run_step "export"      "$PY" export_static.py     # rebuild public/ (data.json + index.html)
 
-  # Redeploy the static mirror to Vercel for mobile access.
-  if command -v vercel >/dev/null 2>&1; then
-    if ( cd public && vercel deploy --prod --yes ); then
-      echo "  [OK]   vercel deploy"
-    else
-      echo "  [FAIL] vercel deploy"
-      rc=1
-    fi
-  else
-    echo "  [SKIP] vercel CLI not on PATH — skipped redeploy"
-  fi
+  # No Vercel deploy here: Vercel auto-deploys from GitHub, whose daily workflow
+  # publishes public/. Deploying from this laptop too made the site flip between
+  # two datasets.
 
   if [ "$rc" -eq 0 ]; then
     echo "===== pipeline OK ====="
