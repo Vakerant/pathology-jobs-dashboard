@@ -4,16 +4,18 @@
 - Hardened /api/flag (allowlist, type checks, 40-char key validation).
 - TLS verification is fixed in scraper.py; this service just serves.
 """
+import hashlib
 import logging
 import threading
 import time
 from collections import deque
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
 
 from flask import Flask, jsonify, render_template, request
 
 import db
 import scraper
+import seed
 import alerts
 import export_static
 import config
@@ -39,6 +41,16 @@ _auto_loop_started = False
 # Held open for the process lifetime by whichever process wins the auto-scrape
 # lock; see _ensure_auto_loop.
 _auto_loop_lock_fh = None
+# Held open for the duration of one in-flight scrape by whichever process
+# actually owns that scrape; see _claim_scrape_slot.
+_scrape_claim_fh = None
+
+# Cross-process scrape claim lockfile. Deliberately a *different* file from the
+# auto-scrape lock: that one is held for the whole process lifetime (it elects
+# the loop owner), whereas this one is held only while a scrape is actually
+# running (it elects the scrape owner). Reusing one file for both would make
+# the in-flight claim invisible for the entire life of the winning process.
+_SCRAPE_LOCK_SUFFIX = scraper.SCRAPE_LOCK_SUFFIX
 
 # Auto-update: while the dashboard runs, re-scrape whenever data gets older
 # than this (covers laptops that are asleep when the daily timer fires).
@@ -158,11 +170,26 @@ def _enforce_rate_limit():
 
 
 def _validate_env():
-    """Fail fast if DB directory is not writable — industry-grade startup check."""
+    """Fail fast if the DB is unusable — industry-grade startup check.
+
+    The write probe is real and stays: proving the database is *writable* is
+    the whole point, and a read-only check would happily pass on a full disk
+    or a read-only mount, only to fail on the first real scrape.
+
+    But it used to run on EVERY import, i.e. once per gunicorn worker per
+    deploy, writing a `_healthcheck` meta row each time. That is a write
+    transaction (and WAL fsync) purely to satisfy a startup assertion, and it
+    makes `db.init_db()`'s own change-detection see a different DB state
+    depending on which worker started first. Keep the write, but do it once
+    per host: the first worker to import performs the probe and records the
+    fact, later workers verify the marker is already present and skip the
+    redundant write.
+    """
     try:
         db.init_db()
-        # prove we can write
-        db.set_meta("_healthcheck", datetime.now(timezone.utc).isoformat())
+        if db.get_meta("_healthcheck") is None:
+            # prove we can write
+            db.set_meta("_healthcheck", datetime.now(timezone.utc).isoformat())
     except Exception as exc:
         log.error("DB init failed at %s: %s", db.DB_PATH, exc)
         raise RuntimeError(f"DB init failed at {db.DB_PATH}: {exc}") from exc
@@ -199,6 +226,39 @@ def readyz():
 
 @app.route("/api/data")
 def api_data():
+    # Conditional GET. The payload is ~1.4 MB of listings and the dashboard
+    # re-polls every 60s, so an unchanged dashboard used to re-download 1.4 MB
+    # a minute forever. Hashing a cheap fingerprint (see db.data_fingerprint)
+    # lets us answer 304 with no body instead.
+    #
+    # The fingerprint has to cover *everything* rendered below, including the
+    # volatile parts, or the UI would go stale:
+    #   - today       : enrich() derives expired/closing_soon/is_new from the
+    #                   date, so midnight must invalidate the cache
+    #   - _is_scraping: a scrape in flight must still show "updating..."
+    #   - the run-summary meta keys, which change even on a 0-new-item scrape
+    etag = None
+    try:
+        raw = db.data_fingerprint(
+            extra="|".join([
+                date.today().isoformat(),
+                "1" if _is_scraping() else "0",
+                db.get_meta("last_run") or "",
+                db.get_meta("last_run_new") or "",
+                db.get_meta("last_run_ok") or "",
+                db.get_meta("last_run_failed") or "",
+                db.get_meta("last_run_projection_ok") or "",
+                db.get_meta("last_run_orphans") or "",
+            ])
+        )
+        if raw:
+            etag = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+            if etag in request.if_none_match:
+                return "", 304
+    except Exception:  # noqa: BLE001 - cache is an optimisation, never a hard dep
+        log.debug("etag build failed; serving full payload", exc_info=True)
+        etag = None
+
     listings = db.fetch_listings()
     status = db.fetch_status()
     db.enrich(listings)
@@ -225,14 +285,95 @@ def api_data():
         "projection_ok": db.get_meta("last_run_projection_ok") == "1",
         "orphans": _meta_int("last_run_orphans"),
     }
-    return jsonify({"listings": listings, "status": status, "stats": stats})
+    response = jsonify({"listings": listings, "status": status, "stats": stats})
+    if etag:
+        response.headers["ETag"] = '"%s"' % etag
+        response.headers["Cache-Control"] = "no-cache"
+    return response
 
 
 # ---------------------------------------------------------------------------
 # Scrape orchestration
 # ---------------------------------------------------------------------------
+def _scrape_lock_path() -> str:
+    return str(config.DB_PATH) + _SCRAPE_LOCK_SUFFIX
+
+
+def _probe_scrape_slot() -> bool:
+    """True when *no other process* currently holds a scrape claim.
+
+    Opens the lockfile and attempts a non-blocking exclusive flock. On success
+    nobody holds it, so release immediately and report "free". On EWOULDBLOCK
+    another live process owns an in-flight scrape. If advisory locking is
+    unavailable (``fcntl`` missing or the filesystem rejects it) we report
+    "free" and let the per-process guard in :func:`_start_scrape` carry the
+    weight — the same degradation :func:`_ensure_auto_loop` already uses.
+    """
+    try:
+        import fcntl
+    except Exception:  # noqa: BLE001 — platform without fcntl
+        return True
+    try:
+        fh = open(_scrape_lock_path(), "w")
+    except OSError as exc:
+        log.warning("scrape claim lockfile unavailable (%s) — in-process guard only", exc)
+        return True
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return False
+    # We got it: nobody else was scraping. Drop it so _start_scrape can take it.
+    try:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    fh.close()
+    return True
+
+
+def _claim_scrape_slot() -> bool:
+    """Take the cross-process in-flight scrape claim. True when acquired."""
+    global _scrape_claim_fh
+    if _scrape_claim_fh is not None:
+        return True  # already ours
+    try:
+        import fcntl
+        fh = open(_scrape_lock_path(), "w")
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            return False
+        _scrape_claim_fh = fh  # keep referenced; closing releases the lock
+        return True
+    except Exception as exc:  # noqa: BLE001 — locking unavailable
+        log.warning("scrape claim lock unavailable (%s) — in-process guard only", exc)
+        _scrape_claim_fh = None
+        return True  # degrade to the per-process guard
+
+
+def _release_scrape_slot():
+    """Release the in-flight scrape claim. Idempotent and exception-safe."""
+    global _scrape_claim_fh
+    fh = _scrape_claim_fh
+    _scrape_claim_fh = None
+    if fh is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except Exception:  # noqa: BLE001 — best effort
+        pass
+    try:
+        fh.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _do_scrape():
     try:
+        seed.run()
         scraper.run(verbose=False)
         try:
             alerts.send_new(verbose=False)      # email new pathology posts
@@ -249,11 +390,25 @@ def _do_scrape():
         # with the clear and observe a stale True.
         with _scrape_lock:
             _scraping["running"] = False
+        # Then drop the cross-process claim. Done after the in-process clear so
+        # the two guards overlap rather than leaving a window where a peer could
+        # observe "free" while this process still believes it is scraping.
+        _release_scrape_slot()
 
 
 def _is_scraping() -> bool:
+    """True if *any* process on this host is scraping.
+
+    Combines the in-process flag with the cross-process flock so the dashboard
+    reports an honest ``scraping`` state when gunicorn runs multiple workers.
+    """
     with _scrape_lock:
-        return bool(_scraping["running"])
+        if _scraping["running"]:
+            return True
+        mine = _scrape_claim_fh is not None
+    if mine:
+        return True
+    return not _probe_scrape_slot()
 
 
 def _meta_int(key: str) -> int:
@@ -276,10 +431,21 @@ def _start_scrape() -> bool:
     lock was released before the spawned thread did any work, so the real
     guard was a lock-free check-then-set on the ``_scraping`` dict and two
     callers could both pass it and launch overlapping scrapes.
+
+    That guard is per-process, and the systemd unit runs ``gunicorn --workers
+    2`` without ``--preload``, so each worker imports this module separately.
+    Two guards are therefore layered: the in-process flag (fast, exact) plus an
+    exclusive flock on a dedicated lockfile (cross-process, elects one owner).
+    Without the flock, worker B's /api/refresh would happily start a second
+    scrape while worker A's auto-loop was already running — duplicating the
+    outbound requests, the alert emails, and the SQLite writes.
     """
     with _scrape_lock:
         if _scraping["running"]:
-            log.info("scrape already running — skip")
+            log.info("scrape already running in this process — skip")
+            return False
+        if not _claim_scrape_slot():
+            log.info("scrape already running in another process — skip")
             return False
         _scraping["running"] = True
     # Start outside the lock: the scrape outlives the claim by design.
@@ -382,7 +548,35 @@ def api_refresh():
 
 @app.route("/api/flag", methods=["POST"])
 def api_flag():
-    """Hardened: allowlist field, validate key (40-char hex), value 0/1."""
+    """Toggle a per-listing flag (`starred` / `hidden`).
+
+    Hardened: allowlist field, validate key (40-char hex), value 0/1.
+
+    KNOWN LIMITATION -- DELIBERATELY UNAUTHENTICATED.
+    `starred` and `hidden` are stored on the SHARED `listings` table, so
+    there is exactly one star set and one hidden set for the whole instance,
+    not one per browser. Any client that can reach this endpoint can change
+    another visitor's stars/hides. The blast radius is bounded by three
+    things, and only those three:
+
+      * the field allowlist -- only `starred` and `hidden` are writable;
+      * key validation -- only real, existing 40-hex listing keys are
+        addressable, so this cannot be used to write arbitrary columns;
+      * ADMIN_RATE_LIMIT (30/min/IP) in `_RATE_LIMITED_PATHS`.
+
+    Why it is not gated behind `config.ADMIN_SECRET`: the dashboard is a
+    single static page, and the flag buttons live in that page's JavaScript.
+    A shared secret that the browser must send therefore has to be embedded
+    in a document that is served to everyone AND published verbatim to the
+    public Vercel mirror by `export_static.build()`. Gating this endpoint
+    would not secure anything -- it would just break the star/hide buttons
+    for everyone while still leaking the secret to every reader.
+
+    The real fix, if this is ever deployed for multiple users, is per-user
+    storage (a client-generated device id, or actual accounts) so there is
+    nothing shared left to tamper with. `ADMIN_SECRET` stays unused on
+    purpose; see config.py for why.
+    """
     try:
         data = request.get_json(force=True)
     except Exception:

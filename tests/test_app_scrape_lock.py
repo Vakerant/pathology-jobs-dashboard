@@ -36,14 +36,20 @@ def client(monkeypatch):
                         {"/api/refresh": 10_000, "/api/flag": 10_000})
     A._rate_limit_reset()
     monkeypatch.setattr(A.scraper, "run", lambda verbose=False: 0)
+    monkeypatch.setattr(A.seed, "run", lambda: 0)
     monkeypatch.setattr(A.alerts, "send_new", lambda verbose=False: 0)
     monkeypatch.setattr(A.export_static, "build", lambda: None)
-    # start from a known-idle slot so tests are order-independent
+    # start from a known-idle slot so tests are order-independent. Both guards
+    # must be reset: the in-process flag *and* the cross-process flock claim,
+    # otherwise a scrape still finishing from an earlier test keeps the claim
+    # held and later tests see a phantom "already scraping".
     with A._scrape_lock:
         A._scraping["running"] = False
+    A._release_scrape_slot()
     yield A.app.test_client()
     with A._scrape_lock:
         A._scraping["running"] = False
+    A._release_scrape_slot()
 
 
 def test_config_is_not_duplicated():
@@ -85,6 +91,14 @@ def test_concurrent_refresh_claims_slot_once(client):
     for t in threads:
         t.join()
 
+    # The winners' scrape runs on a background thread that the joins above do
+    # NOT wait for. Poll the slot so `spawned` is observed after the work has
+    # actually run, instead of racing it.
+    for _ in range(250):
+        if not A._is_scraping():
+            break
+        time.sleep(0.02)
+
     assert len(results) == 12
     started = [b for _, b in results if b.get("started")]
     assert len(started) == 1, f"race: {len(started)} scrapes started"
@@ -110,6 +124,30 @@ def test_is_scraping_reads_under_lock(client):
     A._scraping["running"] = True
     assert A._is_scraping() is True
     A._scraping["running"] = False
+    assert A._is_scraping() is False
+
+
+def test_is_scraping_sees_another_process_claim(client, tmp_path, monkeypatch):
+    """A peer process holding the flock must read as "scraping" here too.
+
+    Under `gunicorn --workers 2` each worker has its own `_scraping` dict, so a
+    process-local read reports idle while a sibling worker is mid-scrape — the
+    dashboard would show a spurious "Update now" button and allow a second
+    refresh. flock conflicts between distinct open file descriptions even
+    within one process, so holding it here faithfully models the peer worker.
+    """
+    import fcntl
+
+    monkeypatch.setattr(A.config, "DB_PATH", tmp_path / "data.db")
+    holder = open(str(tmp_path / "data.db") + A._SCRAPE_LOCK_SUFFIX, "w")
+    fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        assert A._is_scraping() is True
+        # ...and a refresh must be refused rather than starting a 2nd scrape.
+        assert A._start_scrape() is False
+        assert A._scraping["running"] is False
+    finally:
+        holder.close()
     assert A._is_scraping() is False
 
 

@@ -430,7 +430,6 @@ def test_clean_err_maps_the_three_live_failures_to_plain_causes():
 @pytest.mark.skipif(NODE is None, reason="node not installed")
 def test_recency_ladder_boundaries():
     """Boundaries are <1d, <3d, <7d, older -- and the labels must line up."""
-    day = 86_400_000
     cases = {0.0: 0, 0.5: 0, 1.0: 1, 2.9: 1, 3.0: 2, 6.9: 2, 7.0: 3, 400.0: 3}
     for days, tier in cases.items():
         ago = iso_ago(days)

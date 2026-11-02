@@ -1,12 +1,10 @@
 """Tests for the repository/service layer over the domain tables."""
-import json
 from pathlib import Path
 
 import pytest
 
 import config
 import db
-import migrations
 import repository as r
 
 

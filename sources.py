@@ -66,7 +66,14 @@ JUNK_TITLES = {
 }
 
 # Junk link text we never want (nav / social / boilerplate).
-STOPWORDS = [
+#
+# NOTE: this list is intentionally NOT consulted by the scraper. `JUNK_TITLES`
+# above is the live junk filter (scraper._candidates consults it, and exempts
+# PDF links from it so a document titled "View Document" still survives). This
+# list was a second, overlapping idea that never got wired up -- keeping it
+# invites the belief that navigation links are being filtered when in fact only
+# JUNK_TITLES is. Fold anything genuinely useful into JUNK_TITLES instead.
+UNUSED_STOPWORDS_LEGACY = [
     "home", "about us", "contact", "sitemap", "login", "facebook", "twitter",
     "instagram", "youtube", "privacy", "disclaimer", "feedback", "screen reader",
     "skip to", "rti", "tender", "gallery", "photo", "search", "menu",
@@ -121,7 +128,7 @@ SOURCES = [
     {"id": "aiims_bhopal", "name": "AIIMS Bhopal", "region": "INI – Other",
      "category": "INI – Senior Resident", "url": "https://www.aiimsbhopal.edu.in/"},
      {"id": "aiims_jodhpur", "name": "AIIMS Jodhpur", "region": "INI – Other",
-      "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/"},
+     "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/"},
     {"id": "aiims_rishikesh", "name": "AIIMS Rishikesh", "region": "INI – Other",
      "category": "INI – Senior Resident", "url": "https://aiimsrishikesh.edu.in/job-new.php"},
     {"id": "aiims_raipur", "name": "AIIMS Raipur (Chhattisgarh)", "region": "INI – Other",

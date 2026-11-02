@@ -8,8 +8,10 @@ hide expired notices. Each source is isolated in try/except.
 """
 import re
 import sys
+import json
 import logging
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, date
 from urllib.parse import urljoin, urlparse
@@ -164,13 +166,21 @@ BAD_HOSTS = ("youtube.com", "youtu.be", "facebook.com", "twitter.com", "x.com",
 
 NEGATIVE = [
     "total visitor", "visitor count", "all rights reserved",
-    "test", "package", "checkup", "health-pack", "price", "book-", "/book", "cart",
+    # NOTE: the four bare tokens below are matched on word boundaries, not as
+    # substrings — see _NEGATIVE_WORD. As substrings they destroyed real
+    # notices: "test" alone silently rejected every "latest …" headline
+    # ("Latest News" / "latest circular" is standard on government job
+    # portals), and likewise "price" killed "Price List", "package" killed
+    # "package of services", "cme" killed any word containing those letters.
+    # They are listed here for documentation and are NOT consulted by
+    # relevance(); _NEGATIVE_WORD is the single source of truth for them.
+    "checkup", "health-pack", "book-", "/book", "cart",
     "symptom", "disease", "treatment", "/blog", "article", "faq", "sitemap", "login",
     "biochem", "uro-onco", "onco-surg", "oncosurg", "radiolog", "anaesth", "anesth",
     "orthop", "cardiolog", "gynae", "obg", "dermatolog", "nephrolog", "neurosurg",
     "psychiatr", "ophthalm", "paediatric onco", "pediatric onco", "cytogenetic",
     "biochemistry", "microbiolog", "department of lab",
-    "cme", "workshop", "conference", "webinar", "reporting form", "reaction reporting",
+    "workshop", "conference", "webinar", "reporting form", "reaction reporting",
     "seniority", "promotion as", "guideline", "tariff", "syllabus", "curriculum",
     "feedback", "reporting-form", "registration form",
     # Results / admin notices — not job postings
@@ -184,6 +194,13 @@ NEGATIVE = [
     # Nursing-specific (not pathology)
     "tutor (nursing)", "nursing tutor",
 ]
+
+# Short generic words that must only match as whole words. Substring matching
+# them is actively harmful: "test" is the tail of "la-test", "con-test",
+# "pro-test", "grea-test", "fas-test" — and "Latest" appears on nearly every
+# government job portal's landing page, so the substring form silently threw
+# away real recruitment notices with no log line and no fallback.
+_NEGATIVE_WORD = re.compile(r"\b(?:test|price|package|cme|checkup|login|cart)\b", re.I)
 
 # Patterns in link text that indicate a false RECRUIT match.
 # These prevent words like "resident" inside "president" or
@@ -213,6 +230,11 @@ def relevance(text):
     """Judge from the LINK's own text+href only (NOT shared row context)."""
     t = text.lower()
     if any(n in t for n in NEGATIVE):
+        return None
+    # Whole-word pass for the short generic tokens (test/price/package/cme/…).
+    # Must run on the lowercased text with word boundaries so "Latest News"
+    # survives while a genuine "test" link is still rejected.
+    if _NEGATIVE_WORD.search(t):
         return None
     if _NEGATIVE_EXACT.search(t):
         return None
@@ -734,6 +756,10 @@ def scrape_source(src, session=None):
                 except Exception as exc:  # noqa: BLE001
                     log.info("pdf enrich failed %s: %s", it.get("url"), type(exc).__name__)
         found = 0
+        # Collect first, persist as one batch: upsert_listings() shares a single
+        # connection and commits once, instead of opening/committing/closing a
+        # connection for each of a source's ~30 listings.
+        to_persist = []
         for it in items:
             # Final scope backstop. relevance() judges a link's own text, but the
             # title we persist can come from a heading or document title that
@@ -746,7 +772,7 @@ def scrape_source(src, session=None):
             if _off_scope(it.get("title", "")):
                 continue
             found += 1
-            is_new = db.upsert_listing({
+            to_persist.append({
                 "source_id": src["id"], "source_name": src["name"],
                 "region": src["region"], "category": src["category"],
                 "title": it["title"], "url": it["url"], "relevance": it["rel"],
@@ -755,8 +781,7 @@ def scrape_source(src, session=None):
                 "deadline": it["deadline"],
                 "document_type": it.get("document_type", "UNKNOWN"),
             })
-            if is_new:
-                new_count += 1
+        new_count = db.upsert_listings(to_persist)
         db.record_status(src["id"], src["name"], src["region"], "ok", http, found, "")
         return new_count, None
     except Exception as e:  # noqa: BLE001
@@ -764,7 +789,20 @@ def scrape_source(src, session=None):
         return 0, str(e)
 
 
+# Cross-process claim held for the duration of one scrape. app.py uses this too.
+SCRAPE_LOCK_SUFFIX = ".scrape-inflight.lock"
+# How long `python scraper.py` waits for an in-flight scrape. This must stay well
+# under the systemd unit's TimeoutStartSec=30min, which covers the whole pipeline.
+SCRAPE_WAIT_SECONDS = 900
+SCRAPE_WAIT_POLL_SECONDS = 5
+
+
+last_run_ok_sources = None
+
+
 def run(verbose=True):
+    global last_run_ok_sources
+    last_run_ok_sources = None
     db.init_db()
     total_new = 0
     ok, failed = 0, 0
@@ -803,11 +841,13 @@ def run(verbose=True):
             db.record_source_run(run_id, src["id"], "ok", http, found, "")
             if verbose:
                 print(f"  ✓ {src['name']:<42} (+{new} new)")
+    last_run_ok_sources = ok
     pruned = db.prune_stale()
     # Keep the opportunity-first projection in step with the listing store.
     # Without this the mirror drifts (new listings never reach
     # `opportunities`, pruned listings leave orphans behind) and the
     # invariants documented in ARCHITECTURE.md section 4 break.
+    projection_failed = False
     try:
         import repository
         sync = repository.sync_opportunities_from_listings()
@@ -816,20 +856,46 @@ def run(verbose=True):
     except Exception as exc:  # noqa: BLE001
         log.warning("opportunity projection sync failed: %s", exc)
         sync = superseded = projection = None
+        projection_failed = True
+        # A failed projection sync is NOT cosmetic: it means `listings` and the
+        # `opportunities` mirror have silently diverged, which breaks the
+        # invariants in ARCHITECTURE.md section 4. Clearing the meta key makes
+        # that visible (app.api_data reports projection_ok) instead of leaving
+        # the previous run's healthy-looking value in place.
+        db.set_meta("last_run_projection_ok", "")
     db.set_meta("last_run", datetime.now(timezone.utc).isoformat())
     db.set_meta("last_run_new", total_new)
     db.set_meta("last_run_ok", ok)
     db.set_meta("last_run_failed", failed)
-    # 'partial' is the honest label when some sources failed: the listings we
-    # did collect are valid and committed, so this is not a total failure.
+    # Retention: these tables are append-only telemetry, so without an explicit
+    # bound they grow forever. Cheap, idempotent, and never fatal.
+    db.prune_run_history()
+    db.prune_backups()
+    # Status is 'success' only when every source succeeded AND the projection
+    # mirror is consistent. A run whose projection sync blew up used to be
+    # recorded as a plain success, which is how a silently-diverged database
+    # stayed green for weeks. 'degraded' says exactly that: the listings are
+    # fine, the mirror is not.
+    if projection_failed:
+        status = "degraded"
+    elif failed:
+        # 'partial' is the honest label when some sources failed: the listings we
+        # did collect are valid and committed, so this is not a total failure.
+        status = "partial"
+    else:
+        status = "success"
     db.record_run_finish(
-        run_id, datetime.now(timezone.utc).isoformat(),
-        "success" if not failed else "partial",
+        run_id, datetime.now(timezone.utc).isoformat(), status,
         total_sources=len(SOURCES), ok=ok, failed=failed, new_items=total_new,
     )
     if projection is not None:
         db.set_meta("last_run_projection_ok", int(projection["ok"]))
         db.set_meta("last_run_orphans", projection["orphans"])
+        # Also persist the full projection snapshot. Previously ONLY the CI
+        # workflow wrote this key, so a systemd-timer or /api/refresh run left
+        # whatever the last CI job recorded in place — the dashboard and
+        # operators were reading stale numbers indefinitely.
+        db.set_meta("last_run_projection", json.dumps(projection))
     if verbose:
         extra = ""
         if sync:
@@ -840,5 +906,47 @@ def run(verbose=True):
     return total_new
 
 
+def scrape_lock_path() -> str:
+    """The cross-process in-flight scrape claim, shared with app.py."""
+    return str(config.DB_PATH) + SCRAPE_LOCK_SUFFIX
+
+
+def main(verbose=True, wait_seconds=SCRAPE_WAIT_SECONDS) -> int:
+    """CLI entry point: run one scrape under the shared in-flight claim.
+
+    If the dashboard is already scraping, wait for it and then skip, because
+    its results are what the later pipeline steps want and a second scrape
+    would only hammer the same sites. Returns a process exit status.
+    """
+    try:
+        import fcntl
+    except ImportError:  # platform without flock: same degradation as app.py
+        run(verbose=verbose)
+        return 0
+    with open(scrape_lock_path(), "a") as claim:  # closing releases the flock
+        try:
+            fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Another scrape is in flight; waiting for it to finish.")
+            deadline = time.monotonic() + wait_seconds
+            while time.monotonic() < deadline:
+                time.sleep(SCRAPE_WAIT_POLL_SECONDS)
+                try:
+                    fcntl.flock(claim, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    continue
+                print("The other scrape finished; skipping this one.")
+                return 0
+            print(f"Gave up after {wait_seconds}s: the other scrape is still running.")
+            return 1
+        except OSError as exc:
+            log.warning("scrape claim lock unavailable (%s); running unguarded", exc)
+        run(verbose=verbose)
+        if last_run_ok_sources == 0:
+            print('Every source failed; treating this run as a failure.')
+            return 1
+    return 0
+
+
 if __name__ == "__main__":
-    run(verbose="-q" not in sys.argv)
+    sys.exit(main(verbose="-q" not in sys.argv))

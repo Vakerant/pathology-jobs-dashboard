@@ -1,6 +1,9 @@
 """Pytest configuration: ensure project root is importable."""
+import atexit
 import os
+import shutil
 import sys
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -16,7 +19,35 @@ if ROOT not in sys.path:
 # AUTO_SCRAPE_ENABLED=1 cannot turn it back on for the test run.
 os.environ["AUTO_SCRAPE_ENABLED"] = "0"
 
+# app.py also runs init_db() at import time, during collection and so before any
+# fixture. Point it at a scratch directory rather than the real data.db.
+_SCRATCH = tempfile.mkdtemp(prefix="pathology-tests-")
+atexit.register(shutil.rmtree, _SCRATCH, ignore_errors=True)
+os.environ["DB_PATH"] = os.path.join(_SCRATCH, "import-time.db")
+os.environ["BACKUP_DIR"] = os.path.join(_SCRATCH, "backups")
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_real_data(tmp_path, monkeypatch):
+    """Keep every test away from the developer's real data.db and backups/.
+
+    Most tests repoint only db.DB_PATH, but migrations.backup() and the scrape
+    lockfile read config.DB_PATH. Each run therefore checkpointed the real
+    database and copied it into the real backups/ directory, where the copies
+    also pushed older real backups out of retention (BACKUP_KEEP), and a few
+    tests silently read live data. Tests that need a specific path still
+    override these. Each test starts from an initialised, empty scratch DB.
+    """
+    import config
+    import db
+    placeholder = tmp_path / "_isolated.db"
+    monkeypatch.setattr(config, "DB_PATH", placeholder)
+    monkeypatch.setattr(config, "BACKUP_DIR", tmp_path / "_backups")
+    monkeypatch.setattr(db, "DB_PATH", str(placeholder))
+    monkeypatch.setattr(db, "BACKUP_DIR", tmp_path / "_backups")
+    db.init_db()
 
 
 @pytest.fixture(autouse=True)

@@ -76,26 +76,51 @@ def _clean_institution_name(name: str) -> str:
 
 
 def _state_from_region(region: str) -> str | None:
-    """Best-effort factual state extraction; returns None when ambiguous."""
+    """Best-effort factual state/UT extraction; returns None when ambiguous.
+
+    Only genuine states and union territories are returned. Cities are
+    deliberately NOT states: an institution row whose ``state`` column reads
+    "Ahmedabad" or "Mumbai" is factually wrong, even though those strings come
+    from the same source metadata the rest of this table is built from.
+
+    Real region strings in sources.SOURCES include "Ahmedabad / Gujarat",
+    "Delhi / INI", "Chandigarh / INI" and a bare "Mumbai". So the rule is:
+    scan every "/"- or ","-separated part and return the first one that is a
+    real state/UT; only fall back to a city when the region names no state at
+    all (a bare "Mumbai" has no state to find, and returning None is more
+    honest than inventing "Maharashtra").
+    """
     r = (region or "").strip()
-    known = {
+    if not r:
+        return None
+    # Genuine states and union territories only. Delhi and Chandigarh are UTs
+    # and count as states here. Cities (mumbai, ahmedabad, kolkata) are in a
+    # separate set and only used as a last resort below.
+    states = {
         "delhi", "chandigarh", "punjab", "haryana", "himachal pradesh",
-        "mumbai", "gujarat", "ahmedabad", "west bengal", "kolkata",
-        "karnataka", "puducherry", "madhya pradesh", "rajasthan",
-        "uttarakhand", "odisha", "private", "metro", "fellowship",
+        "gujarat", "west bengal", "karnataka", "puducherry",
+        "madhya pradesh", "rajasthan", "uttarakhand", "odisha",
         "uttar pradesh", "kerala", "jammu & kashmir", "assam",
         "jharkhand", "chhattisgarh", "maharashtra", "telangana",
         "andhra pradesh", "tamil nadu", "bihar", "goa",
+        # Non-geographic labels this module already treated as "regions".
+        "private", "metro", "fellowship",
     }
-    # strip "/ INI" style suffixes
-    first = r.split("/")[0].strip()
-    if first.lower() in known:
-        return first
-    # region like "Ahmedabad / Gujarat" -> take Gujarat
-    parts = [p.strip() for p in r.replace("/", ",").split(",")]
-    for p in parts:
-        if p.lower() in known:
-            return p
+    cities = {"mumbai", "ahmedabad", "kolkata"}
+
+    # Prefer a real state/UT anywhere in the string, so "Ahmedabad / Gujarat"
+    # resolves to Gujarat instead of short-circuiting on the city token.
+    for part in re.split(r"[/,]", r):
+        p = part.strip().lower()
+        if p in states:
+            # Return the original casing from the source string, not the key.
+            return part.strip()
+    # No state named. A bare city region ("Mumbai") is all we have — return it
+    # as-is rather than guessing a state, but signal nothing better exists.
+    for part in re.split(r"[/,]", r):
+        p = part.strip().lower()
+        if p in cities:
+            return part.strip()
     return None
 
 
@@ -153,7 +178,14 @@ def _reliability_class(category: str) -> str | None:
     c = (category or "").lower()
     if "private" in c:
         return "PRIVATE"
-    if "ini" in c:
+    # Word-bounded, not a bare substring. `"ini" in c` also matched any category
+    # whose text merely CONTAINED those three letters, silently labelling rows as
+    # INI when they were not. INI appears as its own token in the real
+    # categories ("INI – Senior Resident", "INI – Other"). Delimiters are
+    # word chars plus the " - / |" separators actually used in category
+    # strings -- a plain \b would still fire on "exam-ini", because a hyphen is
+    # itself a word boundary.
+    if re.search(r"(?:^|[\s/|&–—])ini(?:$|[\s/|&–—])", c):
         return "INI"
     if "fellowship" in c or "drnb" in c or "fnb" in c:
         return "FELLOWSHIP"
@@ -455,15 +487,30 @@ def upsert_document(doc: dict) -> bool:
         conn.close()
 
 
-def fetch_documents(opportunity_id: str | None = None) -> list[dict]:
+def fetch_documents(opportunity_id: str | None = None,
+                    include_text: bool = False) -> list[dict]:
+    """Fetch document rows, newest last.
+
+    By default the heavy ``raw_text`` / ``extracted_text`` columns are NOT
+    selected. They hold entire notice bodies; selecting ``*`` with no filter
+    returned every document in the database (1000+ rows, several MB of text) in
+    one call. Callers that genuinely want the bodies ask for them explicitly
+    with ``include_text=True`` -- and should pass ``opportunity_id`` too.
+    """
+    cols = ("*" if include_text
+            else "document_id, opportunity_id, source_id, url, canonical_url, "
+                 "content_type, title, retrieved_at, published_at, content_hash, "
+                 "parser, parser_version, http_status, freshness, document_type")
     conn = db.get_conn()
     try:
         if opportunity_id:
             rows = conn.execute(
-                "SELECT * FROM documents WHERE opportunity_id=? ORDER BY retrieved_at",
+                f"SELECT {cols} FROM documents WHERE opportunity_id=? "
+                "ORDER BY retrieved_at",
                 (opportunity_id,)).fetchall()
         else:
-            rows = conn.execute("SELECT * FROM documents ORDER BY retrieved_at").fetchall()
+            rows = conn.execute(
+                f"SELECT {cols} FROM documents ORDER BY retrieved_at").fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
@@ -586,8 +633,60 @@ def get_profile() -> dict | None:
         conn.close()
 
 
+def _coerce_flag(value, default: int = 0) -> int:
+    """Coerce a truthy/falsey profile field to 0/1 without raising.
+
+    ``int("false")`` raises ValueError, and ``save_profile`` took raw input, so
+    a JSON payload of ``{"research_interest": "false"}`` -- the obvious way to
+    spell a boolean -- blew up the whole save. Accept the common spellings and
+    fall back to the default for anything genuinely uninterpretable rather
+    than turning a cosmetic input problem into a failed write.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return 1 if value else 0
+    if isinstance(value, float):
+        return 1 if value else 0
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return 1
+    if text in ("0", "false", "no", "n", "off", ""):
+        return 0
+    return default
+
+
 def save_profile(profile: dict) -> None:
-    """Save the singleton user profile (id=1). Never hardcodes the author."""
+    """Save the singleton user profile (id=1). Never hardcodes the author.
+
+    Validates its input: a non-dict profile, or one carrying values that cannot
+    be serialised to JSON, is rejected with a clear ValueError instead of
+    failing deep inside sqlite with an opaque driver error.
+    """
+    if not isinstance(profile, dict):
+        raise ValueError("profile must be a dict")
+
+    list_fields = ("preferred_roles", "preferred_specialties",
+                   "preferred_regions", "excluded_roles",
+                   "notification_preferences")
+    for field in list_fields:
+        value = profile.get(field, [])
+        if value is None:
+            profile[field] = []
+            continue
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"profile field {field!r} must be a list")
+        # Fail loudly and specifically on unserialisable content rather than
+        # letting _jdump's TypeError surface with no field name attached.
+        try:
+            json.dumps(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"profile field {field!r} is not JSON-serialisable: {exc}"
+            ) from exc
+
     conn = db.get_conn()
     try:
         conn.execute(
@@ -615,9 +714,9 @@ def save_profile(profile: dict) -> None:
              profile.get("registration"), _jdump(profile.get("preferred_roles", [])),
              _jdump(profile.get("preferred_specialties", [])),
              _jdump(profile.get("preferred_regions", [])),
-             profile.get("work_mode"), profile.get("gov_private_pref"),
-             int(profile.get("research_interest", 0)),
-             int(profile.get("fellowship_interest", 0)),
+profile.get("work_mode"), profile.get("gov_private_pref"),
+              _coerce_flag(profile.get("research_interest")),
+              _coerce_flag(profile.get("fellowship_interest")),
              _jdump(profile.get("excluded_roles", [])),
              _jdump(profile.get("notification_preferences", [])),
              _now()))

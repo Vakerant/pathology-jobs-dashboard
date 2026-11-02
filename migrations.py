@@ -22,16 +22,44 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import config
 import db
 
+log = logging.getLogger("pathology.migrations")
+
+# How long per-run history (scrape_runs / source_runs) is kept. Nothing in the
+# dashboard reads these beyond "did the last run work" (which comes from
+# source_status), so a generous window costs almost nothing and still bounds
+# the tables.
+RUN_HISTORY_DAYS = 90
+
 SCHEMA_VERSION_BASELINE = 1  # legacy listings/source_status/meta schema
+
+# Historical schema versions that some deployed databases carry but that are
+# no longer present in MIGRATIONS (their entry was removed at some point, or the
+# bump came from db.init_db's inline ALTERs). Existing installs record
+# schema_version=4 while this build's highest listed migration is 3.
+#
+# This matters for two reasons:
+#   1. apply_pending() computes pending as "version > stored", so a NEW migration
+#      numbered 4 or lower would be silently skipped on every existing install —
+#      forever, with no error. New entries must therefore be numbered ABOVE
+#      this value.
+#   2. A stored version higher than the highest known migration is benign (it
+#      only means extra steps already ran), so _verify() logs it rather than
+#      raising.
+SCHEMA_VERSION_CONSUMED = max(SCHEMA_VERSION_BASELINE, 4)
+
+# Highest migration version that shipped while the numbering was still
+# contiguous. Versions at or below this are exempt from the guard below.
+SCHEMA_VERSION_SHIPPED = 3
 
 
 # --------------------------------------------------------------------------
@@ -312,15 +340,87 @@ def _add_listings_document_type(conn: sqlite3.Connection) -> None:
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(listings)").fetchall()}
     if "document_type" not in cols:
         conn.execute("ALTER TABLE listings ADD COLUMN document_type TEXT DEFAULT 'UNKNOWN'")
-    conn.commit()
+    # NB: deliberately NO conn.commit() here. apply_pending() owns the
+    # transaction (explicit BEGIN ... COMMIT) and rolls back on error. An inner
+    # commit() ends that transaction behind its back, so a failure in a later
+    # step of the same migration cannot be rolled back and the migration is no
+    # longer atomic. SQLite (legacy autocommit-off mode) implicitly re-opens a
+    # transaction before the DML in _set_schema_version, so removing it is safe.
 
 
 # Ordered migration list. Append-only: never edit or remove an entry once it
 # has shipped, or existing databases will re-run a changed migration.
+def _prune_run_history(conn: sqlite3.Connection) -> None:
+    """Trim the unbounded run-history tables to the retention window.
+
+    ``scrape_runs`` and ``source_runs`` were append-only with no retention
+    policy at all: ``source_runs`` grows by len(SOURCES) (45) rows *per run*,
+    i.e. ~45 rows/day, forever. Unlike ``listings`` — which is pruned at
+    PRUNE_UNSEEN_DAYS — these tables had no bound, so the database grew without
+    limit while contributing nothing the dashboard reads (the dashboard uses
+    ``source_status``, which holds only the latest state per source).
+
+    This is a one-time data migration that brings existing databases into
+    compliance; :func:`db.prune_run_history` keeps them compliant on every
+    subsequent run.
+    """
+    cutoff = (datetime.now(timezone.utc) -
+              timedelta(days=RUN_HISTORY_DAYS)).isoformat()
+    # Drop per-source rows belonging to runs that are themselves too old to
+    # keep. Deleting the parent scrape_runs rows first would orphan these, and
+    # source_runs is by far the bigger table.
+    #
+    # The NULL clause targets stranded rows left by a killed run, scoped by
+    # started_at so it can never match the run currently in flight (which also
+    # has finished_at IS NULL until record_run_finish runs).
+    conn.execute(
+        "DELETE FROM source_runs WHERE "
+        "finished_at < ? OR (finished_at IS NULL AND started_at < ?)",
+        (cutoff, cutoff),
+    )
+    conn.execute(
+        "DELETE FROM scrape_runs WHERE "
+        "finished_at < ? OR (finished_at IS NULL AND started_at < ?)",
+        (cutoff, cutoff),
+    )
+
+
 MIGRATIONS = [
     (2, "phase2_domain_schema", _migrate_phase2_domain),
     (3, "listings_document_type", _add_listings_document_type),
+    (5, "prune_run_history", _prune_run_history),
 ]
+
+
+def _check_version_guard():
+    """Fail loudly if MIGRATIONS can never run on an existing install.
+
+    ``apply_pending`` skips any migration whose version is not greater than the
+    version already stored in the database. A migration numbered at or below
+    ``SCHEMA_VERSION_CONSUMED`` is therefore dead code on every database that
+    already carries that version — it would apply on a brand-new clone and
+    never on the install you are actually running, which is the worst possible
+    failure mode for a migration (looks fine on a fresh test DB, silently does
+    nothing in production).
+
+    Migrations at or below ``SCHEMA_VERSION_SHIPPED`` are exempt: those shipped
+    while the numbering was still contiguous, so they have already run
+    everywhere. Everything above that line must clear SCHEMA_VERSION_CONSUMED.
+    """
+    for version, name, _ in MIGRATIONS:
+        if version <= SCHEMA_VERSION_SHIPPED:
+            continue  # historical, already applied everywhere
+        if version <= SCHEMA_VERSION_CONSUMED:
+            raise AssertionError(
+                f"migration {version} ({name!r}) is numbered between "
+                f"SCHEMA_VERSION_SHIPPED={SCHEMA_VERSION_SHIPPED} and "
+                f"SCHEMA_VERSION_CONSUMED={SCHEMA_VERSION_CONSUMED}; it would be "
+                "silently skipped on every existing install. Renumber it above "
+                f"{SCHEMA_VERSION_CONSUMED}."
+            )
+
+
+_check_version_guard()
 
 
 # --------------------------------------------------------------------------
@@ -356,10 +456,31 @@ def _set_schema_version(conn: sqlite3.Connection, version: int) -> None:
 
 def backup(backup_dir: str | None = None) -> str:
     """Copy data.db (plus -wal/-shm if present) into a timestamped backup dir.
-    Returns the path of the backup file."""
+    Returns the path of the backup file.
+
+    Checkpoints the WAL *before* copying. data.db runs in WAL mode, so recent
+    writes live in the -wal sidecar until a checkpoint; copying the main file
+    alone can capture a database missing its most recent transactions. The old
+    code copied the -wal sidecar too, which is better than nothing but still
+    captures a state that was never a consistent single point in time — a crash
+    between the two copy2 calls leaves a main file and a WAL from different
+    moments. A TRUNCATE checkpoint first makes the main file self-consistent,
+    after which the sidecars are empty and the extra copies are harmless.
+    """
     src = str(config.DB_PATH)
     if not os.path.exists(src):
         raise FileNotFoundError(f"DB not found: {src}")
+    try:
+        conn = sqlite3.connect(src)
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        # Best effort: if the checkpoint fails (another process holds a read
+        # lock, exotic filesystem) still take the copy — an uncheckpointed
+        # backup plus its -wal sidecar beats no backup at all.
+        pass
     dest_dir = backup_dir or str(config.BACKUP_DIR)
     os.makedirs(dest_dir, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -389,6 +510,21 @@ def apply_pending(conn: sqlite3.Connection, target: int | None = None) -> dict:
     if target is not None:
         pending = [m for m in pending if m[0] <= target]
     if not pending:
+        # Still verify. Skipping the invariants on an already-current database
+        # meant they only ever ran during the single migration run that built
+        # the schema, so any later drift went completely unnoticed.
+        #
+        # But only warn here. listings and opportunities legitimately differ
+        # for the whole of a scrape (scraper.run syncs them at the end), and
+        # this runs from every process's init_db(). Raising crashed any process
+        # that started during a scrape, and a scrape killed midway would wedge
+        # every later run, since scraper.run() calls init_db() before it can
+        # reach the sync that repairs the drift. Lasting drift is still caught:
+        # verify_projection() runs after each scrape and gates CI publishing.
+        try:
+            _verify(conn)
+        except RuntimeError as exc:
+            log.warning("projection drift (expected during a scrape): %s", exc)
         report["version"] = current
         return report
     for version, name, func in pending:
@@ -448,17 +584,42 @@ def rollback(backup_path: str) -> None:
 
 
 def _verify(conn: sqlite3.Connection) -> None:
-    """Post-migration sanity checks. Raises if an invariant is broken."""
+    """Post-migration sanity checks. Raises if an invariant is broken.
+
+    Runs on every ``apply_pending`` call, including when nothing was pending —
+    otherwise the invariants would only ever be checked during the one migration
+    run that created the schema, and any later drift (a bad prune, a hand edit,
+    an interrupted run) would go unnoticed forever.
+
+    The opportunities check deliberately compares against *live* opportunities
+    (``lifecycle_state='ACTIVE'``), not the total row count. repository.reconcile_
+    orphans() intentionally keeps superseded rows as history, so once pruning has
+    run the total legitimately exceeds the listing count; comparing totals raises
+    a bogus "migration not lossless" on a perfectly healthy database. repository.
+    verify_projection() uses exactly this same live-opportunities rule.
+    """
     version = get_schema_version(conn)
     expected = [m[0] for m in MIGRATIONS]
     applied = [v for v in expected if v <= version]
+    if version > max(expected, default=SCHEMA_VERSION_BASELINE):
+        # Not fatal: existing databases carry a version above this build's
+        # highest known migration (see SCHEMA_VERSION_CONSUMED). It only
+        # means extra steps ran that are no longer listed. The real danger is
+        # the reverse — a *new* migration numbered at or below an already-
+        # stored version would be silently skipped — which is what
+        # SCHEMA_VERSION_CONSUMED exists to document and prevent.
+        log.debug("schema_version %d is ahead of known migrations %s",
+                  version, expected)
     if 2 in applied:
         n_list = conn.execute("SELECT COUNT(*) FROM listings").fetchone()[0]
-        n_opp = conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
-        # opportunities are a 1:1 lossless projection of listings during Phase 2
+        n_opp = conn.execute(
+            "SELECT COUNT(*) FROM opportunities WHERE lifecycle_state='ACTIVE'"
+        ).fetchone()[0]
+        # Live opportunities are a 1:1 projection of listings.
         if n_opp != n_list:
             raise RuntimeError(
-                f"opportunities ({n_opp}) != listings ({n_list}); migration not lossless"
+                f"live opportunities ({n_opp}) != listings ({n_list}); "
+                "projection not lossless"
             )
         n_doc = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         # documents are per-URL, so distinct listings sharing a URL collapse to

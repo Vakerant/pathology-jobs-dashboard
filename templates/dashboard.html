@@ -611,7 +611,10 @@ const DAY = 86400000;
 /* ── load ─────────────────────────────────────────────────────────── */
 async function load(){
   try{
-    const r = await fetch('/api/data', {cache:'no-store'});
+    // 'no-cache' (not 'no-store') on purpose: it still revalidates every time,
+    // but lets the browser hold the body and send If-None-Match, so an
+    // unchanged dashboard costs a 304 with no body instead of ~1.4 MB.
+    const r = await fetch('/api/data', {cache:'no-cache'});
     DATA = await r.json(); STATIC = false;
   }catch(_){
     try{

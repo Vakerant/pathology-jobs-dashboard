@@ -1,5 +1,4 @@
 """Unit tests for scraper date extraction (deterministic, no network)."""
-import pytest
 from scraper import extract_dates, extract_latest_date
 
 

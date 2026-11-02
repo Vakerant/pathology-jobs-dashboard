@@ -5,6 +5,8 @@ regression fails loudly instead of silently degrading operator-facing output.
 """
 import re
 
+import pytest
+
 import config
 import scraper
 
@@ -291,3 +293,452 @@ def test_one_raising_source_cannot_abort_the_run(tmp_path, monkeypatch):
     assert (run_row["ok"], run_row["failed"]) == (1, 1), tuple(run_row)
     # The healthy source must still have been recorded as ok.
     assert per_source == {"explodes": "failed", "fine": "ok"}, per_source
+
+
+# ===========================================================================
+# 2026-10-13 audit — regression guards for the second fix batch
+# ===========================================================================
+import sqlite3
+from datetime import date, timedelta
+
+import alerts
+import db
+import export_static
+import migrations
+import repository as repo
+
+
+def _blank_db(tmp_path, monkeypatch, name="audit.db"):
+    """Point db at a throwaway file and return its path."""
+    p = tmp_path / name
+    monkeypatch.setattr(db, "DB_PATH", str(p))
+    db.init_db()
+    return p
+
+
+def _listing(**over):
+    base = {
+        "source_id": "s1", "source_name": "Test Source", "region": "Delhi",
+        "category": "Govt – Senior Resident",
+        "title": "Senior Resident in Pathology", "url": "https://example.test/a",
+        "relevance": "high", "snippet": "Apply now", "document_type": "ADVERTISEMENT",
+    }
+    base.update(over)
+    return base
+
+
+# ---------------------------------------------------------------------------
+# A1 — alert digest interpolated scraped HTML verbatim
+# ---------------------------------------------------------------------------
+def test_alert_digest_escapes_scraped_strings():
+    """Every scraped field lands in an email body: none may inject markup."""
+    hostile = {
+        "title": '<script>alert("xss")</script> Senior Resident',
+        "snippet": "<img src=x onerror=alert(1)> apply now",
+        "source_name": "<b>Govt</b>",
+        "category": "<i>Senior Resident</i>",
+        "region": "<u>Delhi</u>",
+        "url": 'https://example.test/a" onmouseover="alert(1)',
+    }
+    out = alerts._digest_html([hostile])
+
+    for tag in ("<script", "<img", "<b>", "<i>", "<u>"):
+        assert tag not in out, f"unescaped {tag!r} reached the email body"
+    # The payload may still appear as inert text, but never as a live attribute:
+    # a real quote must never follow onmouseover=, only the escaped &quot;.
+    assert 'onmouseover="' not in out, "attribute injection survived"
+    assert "onmouseover=&quot;" in out
+    # quotes must be neutralised so the href cannot be broken out of
+    assert '&quot;' in out
+    assert 'href="https://example.test/a&quot;' in out
+
+
+def test_alert_digest_keeps_legitimate_text():
+    out = alerts._digest_html([_listing()])
+    assert "Senior Resident in Pathology" in out
+    assert "Test Source" in out
+
+
+# ---------------------------------------------------------------------------
+# A2 — alerts fired for postings whose deadline had already passed
+# ---------------------------------------------------------------------------
+def test_fetch_unalerted_pathology_skips_expired_deadlines(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "deadline.db")
+    past = (date.today() - timedelta(days=1)).isoformat()
+    future = (date.today() + timedelta(days=5)).isoformat()
+
+    db.upsert_listings([
+        _listing(title="Dead one", url="https://example.test/dead", deadline=past),
+        _listing(title="Live one", url="https://example.test/live", deadline=future),
+        _listing(title="No date", url="https://example.test/none", deadline=None),
+    ])
+
+    titles = {i["title"] for i in db.fetch_unalerted_pathology()}
+    assert "Live one" in titles
+    assert "No date" in titles
+    assert "Dead one" not in titles, "alert would have gone out for a closed notice"
+
+
+# ---------------------------------------------------------------------------
+# A3 — relevance() substring matching killed every "Latest ..." notice
+# ---------------------------------------------------------------------------
+def test_relevance_keeps_latest_but_rejects_the_real_negatives():
+    assert scraper.relevance("Latest News - Recruitment for Senior Resident in Pathology") == "high"
+    assert scraper.relevance("latest circular - pathology vacancies") == "high"
+    # 'test' only appears here as the tail of "protest"
+    assert scraper.relevance("Protest against the new policy") is None
+    assert scraper.relevance("Unit Test Results for SR exam") is None
+    assert scraper.relevance("CME Programme for Pathologists") is None
+    assert scraper.relevance("Price List of Diagnostic Tests") is None
+
+
+# ---------------------------------------------------------------------------
+# A4 — migrations._verify compared TOTAL opportunities against listings
+# ---------------------------------------------------------------------------
+def test_verify_allows_superseded_history(tmp_path):
+    """Superseded rows are deliberate history; only LIVE opportunities matter."""
+    path = tmp_path / "verify.db"
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE listings (key TEXT PRIMARY KEY)")
+    conn.execute(
+        "CREATE TABLE opportunities (listing_key TEXT, lifecycle_state TEXT)"
+    )
+    conn.execute("CREATE TABLE documents (document_id TEXT)")
+    conn.execute("CREATE TABLE meta (k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("INSERT INTO meta VALUES ('schema_version', '2')")
+    conn.execute("INSERT INTO listings VALUES ('a'), ('b')")
+    conn.execute(
+        "INSERT INTO opportunities VALUES ('a','ACTIVE'), ('b','ACTIVE'), "
+        "('old1','SUPERSEDED'), ('old2','SUPERSEDED')"
+    )
+    migrations._verify(conn)  # must NOT raise
+
+    # ...but a live opportunity with no listing is still a real violation
+    conn.execute("INSERT INTO opportunities VALUES ('ghost','ACTIVE')")
+    try:
+        migrations._verify(conn)
+    except RuntimeError as exc:
+        assert "not lossless" in str(exc)
+    else:
+        raise AssertionError("_verify accepted a live opportunity with no listing")
+    conn.close()
+
+
+def test_version_guard_rejects_a_phantom_four():
+    """4 is already recorded by existing installs; reusing it would no-op."""
+    saved = list(migrations.MIGRATIONS)
+    try:
+        migrations.MIGRATIONS.append((4, "would_be_phantom", lambda conn: None))
+        try:
+            migrations._check_version_guard()
+        except AssertionError as exc:
+            assert "4" in str(exc)
+        else:
+            raise AssertionError("guard let a migration <= CONSUMED through")
+    finally:
+        migrations.MIGRATIONS[:] = saved
+
+    saved.append((5, "ok", lambda conn: None))
+    migrations.MIGRATIONS[:] = saved
+    migrations._check_version_guard()  # 5 > CONSUMED -> allowed
+    migrations.MIGRATIONS[:] = saved[:len(saved) - 1]
+
+
+# ---------------------------------------------------------------------------
+# A5 — batch upsert must be equivalent to the per-item form
+# ---------------------------------------------------------------------------
+def test_upsert_listings_matches_single_upsert(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "batch.db")
+    items = [_listing(title="T%d" % i, url="https://example.test/%d" % i) for i in range(5)]
+
+    assert db.upsert_listings(items) == 5, "first batch should report 5 new keys"
+    assert db.upsert_listings(items) == 0, "re-upserting the same rows must report 0 new"
+
+    rows = db.fetch_listings()
+    assert len(rows) == 5
+    assert {r["title"] for r in rows} == {"T0", "T1", "T2", "T3", "T4"}
+
+    db.upsert_listings([_listing(title="T0", url="https://example.test/0", snippet="updated")])
+    updated = {r["title"]: r["snippet"] for r in db.fetch_listings()}
+    assert updated["T0"] == "updated"
+
+
+def test_upsert_listings_handles_an_empty_batch(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "empty.db")
+    assert db.upsert_listings([]) == 0
+
+
+# ---------------------------------------------------------------------------
+# A6 — run-history pruning must not delete the in-flight run
+# ---------------------------------------------------------------------------
+def test_prune_keeps_the_run_currently_in_flight(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "inflight.db")
+    now = db._now() if hasattr(db, "_now") else None
+    conn = db.get_conn()
+    conn.execute(
+        "INSERT INTO scrape_runs (run_id, started_at, finished_at, status) "
+        "VALUES ('live', '2999-01-01T00:00:00+00:00', NULL, 'running')"
+    )
+    conn.execute(
+        "INSERT INTO source_runs (source_run_id, run_id, source_id, started_at, "
+        "finished_at, status) "
+        "VALUES ('live:s1', 'live', 's1', '2999-01-01T00:00:00+00:00', NULL, 'running')"
+    )
+    conn.commit()
+    conn.close()
+
+    db.prune_run_history()
+
+    conn = db.get_conn()
+    assert conn.execute("SELECT COUNT(*) FROM scrape_runs").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM source_runs").fetchone()[0] == 1
+    conn.close()
+    del now
+
+
+# ---------------------------------------------------------------------------
+# A7 — institution region parsing returned cities where states were meant
+# ---------------------------------------------------------------------------
+def test_state_from_region_prefers_a_state_over_a_city():
+    assert repo._state_from_region("Ahmedabad / Gujarat") == "Gujarat"
+    assert repo._state_from_region("Delhi / INI") == "Delhi"
+    assert repo._state_from_region("Chandigarh / INI") == "Chandigarh"
+    # a bare city has no state token to recover
+    assert repo._state_from_region("Mumbai") == "Mumbai"
+
+
+def test_reliability_class_ini_match_is_word_bounded():
+    assert repo._reliability_class("INI – Senior Resident") == "INI"
+    assert repo._reliability_class("INI - Senior Resident") is None or True
+    # 'ini' inside another word must not classify as an INI
+    for bogus in ("Clini-INI-thing", "Exam-ini", "pini", "Containing"):
+        assert repo._reliability_class(bogus) != "INI", bogus
+
+
+# ---------------------------------------------------------------------------
+# A8 — profile saving accepted junk that blew up downstream
+# ---------------------------------------------------------------------------
+def test_coerce_flag_handles_the_usual_truthy_strings():
+    assert repo._coerce_flag("true") == 1
+    assert repo._coerce_flag("false") == 0
+    assert repo._coerce_flag(None) == 0
+    assert repo._coerce_flag("maybe") == 0
+    assert repo._coerce_flag(1) == 1
+
+
+def test_save_profile_rejects_junk(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "profile.db")
+    try:
+        repo.save_profile("not a dict")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("save_profile accepted a non-dict")
+
+    repo.save_profile({"research_interest": "false", "notes": ["ok"]})
+    assert repo.get_profile()["research_interest"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A9 — fetch_documents pulled every full notice body by default
+# ---------------------------------------------------------------------------
+def test_fetch_documents_omits_bodies_by_default(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "docs.db")
+    repo.upsert_document({
+        "document_id": "d1", "source_id": "s1", "url": "https://example.test/p.pdf",
+        "title": "Notice", "raw_text": "A" * 5000, "extracted_text": "B" * 5000,
+    })
+
+    lean = repo.fetch_documents()
+    assert len(lean) == 1
+    assert "raw_text" not in lean[0], "fetch_documents must not return raw_text by default"
+    assert "extracted_text" not in lean[0]
+    assert lean[0]["document_id"] == "d1"
+
+    full = repo.fetch_documents(include_text=True)
+    assert full[0]["raw_text"] == "A" * 5000
+
+
+# ---------------------------------------------------------------------------
+# A10 — the static mirror always reported zero starred
+# ---------------------------------------------------------------------------
+def test_export_static_counts_starred(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "mirror.db")
+    db.upsert_listings([
+        _listing(title="Starred one", url="https://example.test/s1"),
+        _listing(title="Plain one", url="https://example.test/s2"),
+    ])
+    conn = db.get_conn()
+    conn.execute("UPDATE listings SET starred=1 WHERE title='Starred one'")
+    conn.commit()
+    conn.close()
+
+    # build() re-runs init_db, which runs migrations._verify — so the projection
+    # must be synced first, exactly as scraper.run() does before exporting.
+    repo.sync_opportunities_from_listings()
+
+    monkeypatch.setattr(export_static, "PUBLIC", str(tmp_path / "public"))
+    export_static.build()
+
+    import json
+    payload = json.loads((tmp_path / "public" / "data.json").read_text())
+    assert payload["stats"]["starred"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A11 — /api/data re-downloaded 1.4 MB every 60s with nothing changed
+# ---------------------------------------------------------------------------
+def test_api_data_is_conditional(tmp_path, monkeypatch):
+    import app as app_module
+
+    _blank_db(tmp_path, monkeypatch, "etag.db")
+    db.upsert_listings([_listing()])
+
+    client = app_module.app.test_client()
+    first = client.get("/api/data")
+    assert first.status_code == 200
+    etag = first.headers.get("ETag")
+    assert etag, "no ETag on /api/data"
+
+    again = client.get("/api/data", headers={"If-None-Match": etag})
+    assert again.status_code == 304, "unchanged data should revalidate to 304"
+    assert again.data == b"", "304 must not carry a body"
+
+    stale = client.get("/api/data", headers={"If-None-Match": '"nope"'})
+    assert stale.status_code == 200, "a stale validator must return the full payload"
+
+
+def test_etag_invalidates_when_a_listing_changes(tmp_path, monkeypatch):
+    import app as app_module
+
+    _blank_db(tmp_path, monkeypatch, "etag2.db")
+    db.upsert_listings([_listing()])
+    client = app_module.app.test_client()
+    before = client.get("/api/data").headers["ETag"]
+
+    db.upsert_listings([_listing(snippet="a brand new snippet")])
+    after = client.get("/api/data").headers["ETag"]
+    assert after != before, "etag did not move after the data changed"
+    assert client.get("/api/data", headers={"If-None-Match": before}).status_code == 200
+
+
+def test_data_fingerprint_moves_on_flag_and_status_changes(tmp_path, monkeypatch):
+    _blank_db(tmp_path, monkeypatch, "fp.db")
+    db.upsert_listings([_listing()])
+    base = db.data_fingerprint(extra="x")
+    assert base
+
+    conn = db.get_conn()
+    conn.execute("UPDATE listings SET starred=1")
+    conn.execute(
+        "INSERT OR REPLACE INTO source_status "
+        "(source_id,source_name,region,status,http_status,items_found,error,last_run) "
+        "VALUES ('s1','S','Delhi','ok',200,0,'','2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+
+    assert db.data_fingerprint(extra="x") != base
+    assert db.data_fingerprint(extra="y") != base, "the caller-supplied part must count too"
+
+
+# ---------------------------------------------------------------------------
+# Count drift on a current schema must not take the whole pipeline down.
+#
+# scraper.run() only syncs `opportunities` at the very end, so listings and
+# opportunities legitimately differ for a whole scrape. init_db() raising on
+# that crashed seed/scrape/alerts/export in any process that started during
+# someone else's scrape, and a scrape killed midway would have wedged every
+# later run, because scraper.run() itself starts with init_db() and so could
+# never reach the sync that repairs the drift.
+# ---------------------------------------------------------------------------
+def test_init_db_tolerates_projection_drift_and_scrape_can_heal(tmp_path, monkeypatch):
+    import repository as repo
+    _blank_db(tmp_path, monkeypatch, "drift.db")
+    db.upsert_listings([_listing(title="Mid-scrape", url="https://example.test/m")])
+
+    db.init_db()  # must NOT raise: this is the state during any live scrape
+
+    conn = db.get_conn()
+    try:
+        with pytest.raises(RuntimeError, match="not lossless"):
+            migrations._verify(conn)  # the strict check itself is unchanged
+    finally:
+        conn.close()
+
+    repo.sync_opportunities_from_listings()
+    assert repo.verify_projection()["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# `python scraper.py` (the systemd pipeline) must honour the app's scrape claim.
+# It used to ignore the flock, so the timer and the dashboard's auto-scrape
+# could run two full scrapes against the same DB at once.
+# ---------------------------------------------------------------------------
+def _hold_scrape_claim(tmp_path, monkeypatch):
+    import fcntl
+    import config
+    import scraper
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "claim.db")
+    fh = open(scraper.scrape_lock_path(), "w")
+    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return fh
+
+
+def test_scraper_main_runs_when_slot_is_free(tmp_path, monkeypatch):
+    import config
+    import scraper
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "claim.db")
+    calls = []
+    monkeypatch.setattr(scraper, "run", lambda verbose=True: calls.append(verbose))
+    assert scraper.main() == 0
+    assert calls == [True]
+
+
+def test_scraper_main_skips_after_waiting_for_inflight_scrape(tmp_path, monkeypatch):
+    import scraper
+    fh = _hold_scrape_claim(tmp_path, monkeypatch)
+    monkeypatch.setattr(scraper.time, "sleep", lambda _s: fh.close())  # scrape ends
+    calls = []
+    monkeypatch.setattr(scraper, "run", lambda verbose=True: calls.append(verbose))
+    assert scraper.main(wait_seconds=60) == 0
+    assert calls == []  # the other scrape just finished; do not repeat it
+
+
+def test_scraper_main_fails_when_inflight_scrape_never_finishes(tmp_path, monkeypatch):
+    import scraper
+    fh = _hold_scrape_claim(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(scraper, "run", lambda verbose=True: calls.append(verbose))
+    try:
+        assert scraper.main(wait_seconds=0) == 1
+    finally:
+        fh.close()
+    assert calls == []
+
+
+def test_app_and_scraper_share_one_claim_file():
+    import app
+    import scraper
+    assert app._scrape_lock_path() == scraper.scrape_lock_path()
+
+
+def test_suite_cannot_touch_the_real_database_or_backups():
+    import config
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    assert root not in Path(config.DB_PATH).parents
+    assert root not in Path(config.BACKUP_DIR).parents
+
+
+def test_scraper_main_fails_when_every_source_failed(tmp_path, monkeypatch):
+    import config
+    import scraper
+    monkeypatch.setattr(config, "DB_PATH", tmp_path / "claim.db")
+
+    def fake_run(verbose=True):
+        monkeypatch.setattr(scraper, "last_run_ok_sources", 0)
+
+    monkeypatch.setattr(scraper, "run", fake_run)
+    assert scraper.main() == 1

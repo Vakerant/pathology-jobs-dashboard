@@ -208,8 +208,7 @@ def test_collect_survives_a_failing_index_page():
 
 def test_collect_dedupes_on_title_and_url(monkeypatch):
     monkeypatch.setattr(scraper, "MAX_ITEMS_PER_SOURCE", 500)
-    # The same PDF is linked twice from the index page.
-    html = INDEX_HTML + INDEX_HTML
+    # The same PDF is linked twice from the index page (dedup must collapse it).
     sess = FakeSession({})
     items = scraper._collect(HOMEPAGE_HTML, "https://aiimsjodhpur.edu.in/", sess)
     seen = [(i["title"].lower(), i["url"]) for i in items]

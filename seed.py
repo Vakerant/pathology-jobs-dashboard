@@ -141,10 +141,10 @@ SEEDS = [
 
 def run():
     db.init_db()
-    for s in SEEDS:
-        s = dict(s)
-        s["is_seed"] = 1
-        db.upsert_listing(s)
+    # One batch -> one connection, one transaction (21 separate connections and
+    # commits is pure overhead for a fixed, hand-verified list).
+    rows = [dict(s, is_seed=1) for s in SEEDS]
+    db.upsert_listings(rows)
     print(f"Seeded {len(SEEDS)} verified opportunities.")
 
 

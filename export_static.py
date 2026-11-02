@@ -34,7 +34,7 @@ def build():
         "active_pathology": len(active_path),
         "closing_soon": sum(1 for l in visible if l.get("closing_soon")),
         "expired": sum(1 for l in visible if l["expired"]),
-        "starred": 0,
+        "starred": sum(1 for l in visible if l["starred"]),
         "sources_ok": sum(1 for s in status if s["status"] == "ok"),
         "sources_failed": sum(1 for s in status if s["status"] == "failed"),
         "last_run": db.get_meta("last_run"),
@@ -42,8 +42,17 @@ def build():
     }
     payload = {"listings": listings, "status": status, "stats": stats}
 
-    with open(os.path.join(PUBLIC, "data.json"), "w") as f:
+    # Write atomically. A plain open+json.dump leaves a truncated file if the
+    # process dies mid-write, and this file is the entire data source for the
+    # deployed mirror — a torn write publishes a broken dashboard. Write to a
+    # sibling temp file and os.replace() it in, which is atomic on POSIX.
+    data_path = os.path.join(PUBLIC, "data.json")
+    tmp_path = data_path + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
+        f.flush()
+        os.fsync(f.fileno())   # durable before the rename swaps it in
+    os.replace(tmp_path, data_path)
 
     # The dashboard template doubles as the static page (it auto-detects).
     shutil.copyfile(os.path.join(HERE, "templates", "dashboard.html"),
