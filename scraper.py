@@ -17,6 +17,7 @@ from datetime import datetime, timezone, date
 from urllib.parse import urljoin, urlparse
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
@@ -45,7 +46,6 @@ if pypdf is not None:
 
 log = logging.getLogger("scraper")
 # Only suppress InsecureRequestWarning if insecure hosts are explicitly allowed
-import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
@@ -617,7 +617,7 @@ def _pdf_subject(text):
         return None
     m = _SUBJECT_RE.search(t)
     if m:
-        cand = _clean((m.group("labelled") or m.group("sentence") or "")).strip(" .;-–—")
+        cand = _clean(m.group("labelled") or m.group("sentence") or "").strip(" .;-–—")
         if len(cand) >= 15:
             return cand
     # Fall back to the first substantive chunk, flattened. Split only before an
@@ -949,4 +949,5 @@ def main(verbose=True, wait_seconds=SCRAPE_WAIT_SECONDS) -> int:
 
 
 if __name__ == "__main__":
+    config.setup_logging()
     sys.exit(main(verbose="-q" not in sys.argv))

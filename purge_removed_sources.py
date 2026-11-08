@@ -206,4 +206,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    import config
+    config.setup_logging()
     sys.exit(main())

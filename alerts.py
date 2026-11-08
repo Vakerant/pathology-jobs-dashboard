@@ -33,6 +33,7 @@ import sys
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from urllib.parse import urlsplit
 
 import db
 import config
@@ -137,6 +138,19 @@ def _esc(value):
     return html_lib.escape(str(value if value is not None else ""), quote=True)
 
 
+def _link(url, title):
+    """Anchor for http(s) URLs; plain escaped text for any other scheme.
+
+    ``html.escape`` stops attribute breakout but not a ``javascript:`` or
+    ``data:`` URL, and the URL comes from a third-party page.
+    """
+    style = "font-size:15px;font-weight:600;color:#1a56db;text-decoration:none"
+    if urlsplit(str(url or "").strip()).scheme.lower() in ("http", "https"):
+        return (f'<a href="{_esc(url)}" rel="noopener noreferrer" '
+                f'style="{style}">{_esc(title)}</a>')
+    return f'<span style="{style}">{_esc(title)}</span>'
+
+
 def _digest_html(items):
     by_region = {}
     for it in items:
@@ -148,7 +162,7 @@ def _digest_html(items):
             snip = f"<div style='color:#555;font-size:13px;margin-top:3px'>{_esc(it.get('snippet'))}</div>" if it.get("snippet") else ""
             rows += f"""
             <div style="padding:12px 0;border-bottom:1px solid #eee">
-              <a href="{_esc(it['url'])}" rel="noopener noreferrer" style="font-size:15px;font-weight:600;color:#1a56db;text-decoration:none">{_esc(it['title'])}</a>
+              {_link(it['url'], it['title'])}
               <div style="color:#777;font-size:12px;margin-top:3px">{_esc(it.get('source_name'))} · {_esc(it.get('category'))}</div>
               {snip}
             </div>"""
@@ -210,6 +224,7 @@ def send_test():
 
 
 if __name__ == "__main__":
+    config.setup_logging()
     db.init_db()
     if "--baseline" in sys.argv:
         n = db.baseline_mark_all_alerted()
