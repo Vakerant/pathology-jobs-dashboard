@@ -84,6 +84,23 @@ def _session():
     s.headers.update(HEADERS)
     return s
 
+def _html_text(resp):
+    """Decode a response body without trusting requests' Latin-1 default.
+
+    When a server omits ``charset`` from Content-Type, ``requests`` assumes
+    ISO-8859-1 per RFC 2616, which turns UTF-8 Hindi/Devanagari titles into
+    mojibake ("à¤à¥..."). AIIMS New Delhi hit this: 60 unreadable titles.
+    Honour an explicit charset; otherwise try UTF-8 first, then the detected one.
+    """
+    if "charset" in resp.headers.get("content-type", "").lower():
+        return resp.text
+    raw = resp.content
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(resp.apparent_encoding or "utf-8", errors="replace")
+
+
 # ---------------- date extraction ----------------
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
@@ -719,7 +736,7 @@ def _collect(source_html, source_url, session):
         except Exception as exc:  # noqa: BLE001
             log.info("index %s -> %s", link, type(exc).__name__)
             continue
-        for it in _candidates(r.text, r.url):
+        for it in _candidates(_html_text(r), r.url):
             k = (it["title"].lower(), it["url"])
             if k in seen:
                 continue
@@ -740,7 +757,7 @@ def scrape_source(src, session=None):
         if http >= 400:
             db.record_status(src["id"], src["name"], src["region"], "failed", http, 0, f"HTTP {http}")
             return 0, f"HTTP {http}"
-        items = _collect(resp.text, resp.url, sess)
+        items = _collect(_html_text(resp), resp.url, sess)
         # PDF enrichment is best-effort and bounded: one unreadable document must
         # never take a whole source down.
         if pypdf is not None:
@@ -800,6 +817,50 @@ SCRAPE_WAIT_POLL_SECONDS = 5
 last_run_ok_sources = None
 
 
+# Errors that are worth one more attempt after the main pass: DNS hiccups,
+# timeouts and resets. Seen in production: five of seven "failed" sources
+# recovered on an immediate re-run, so a single flaky lookup was silently
+# dropping whole regions for a day. HTTP 4xx (403 bot-blocks, 404) is a
+# deliberate or permanent answer and is never retried.
+RETRY_PASS_DELAY = 15  # seconds to let DNS / upstream recover before retrying
+_TRANSIENT_MARKERS = ("max retries exceeded", "timed out", "timeout",
+                      "name resolution", "nameresolution", "temporary failure",
+                      "connection reset", "connection aborted", "connection refused")
+
+
+def _is_transient(err):
+    e = (err or "").lower()
+    if e.startswith("http 4"):
+        return False
+    return any(m in e for m in _TRANSIENT_MARKERS)
+
+
+def _retry_transient_failures(results, sources, delay=None):
+    """One more attempt for sources that failed transiently. Mutates ``results``."""
+    redo = [s for s in sources if _is_transient((results.get(s["id"]) or (0, ""))[1])]
+    if not redo:
+        return 0
+    wait = RETRY_PASS_DELAY if delay is None else delay
+    log.info("retrying %d source(s) after transient failure in %ss", len(redo), wait)
+    if wait:
+        time.sleep(wait)
+    recovered = 0
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(redo))) as pool:
+        futs = {pool.submit(scrape_source, s, _session()): s for s in redo}
+        for fut in as_completed(futs):
+            sid = futs[fut]["id"]
+            try:
+                res = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("source %s raised on retry: %s", sid, exc)
+                continue
+            if not res[1]:
+                recovered += 1
+            results[sid] = res
+    log.info("retry pass recovered %d/%d source(s)", recovered, len(redo))
+    return recovered
+
+
 def run(verbose=True):
     global last_run_ok_sources
     last_run_ok_sources = None
@@ -826,6 +887,7 @@ def run(verbose=True):
                 sid = futures[fut]["id"]
                 log.warning("source %s raised: %s", sid, exc)
                 results[sid] = (0, f"unhandled: {exc}"[:300])
+    _retry_transient_failures(results, SOURCES)
     for src in SOURCES:                      # report in registry order
         new, err = results.get(src["id"], (0, "no result returned"))
         total_new += new

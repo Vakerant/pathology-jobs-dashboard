@@ -742,3 +742,65 @@ def test_scraper_main_fails_when_every_source_failed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(scraper, "run", fake_run)
     assert scraper.main() == 1
+
+
+# ---------------------------------------------------------------------------
+# Transient source failures get one retry pass (DNS blips dropped whole regions)
+# ---------------------------------------------------------------------------
+def test_is_transient_classification():
+    assert scraper._is_transient("HTTPSConnectionPool(host='x'): Max retries exceeded (NameResolutionError)")
+    assert scraper._is_transient("Read timed out.")
+    assert not scraper._is_transient("HTTP 403")
+    assert not scraper._is_transient("HTTP 404")
+    assert not scraper._is_transient(None)
+    assert not scraper._is_transient("")
+
+
+def test_retry_pass_recovers_only_transient_failures(monkeypatch):
+    calls = []
+
+    def fake_scrape(src, session=None):
+        calls.append(src["id"])
+        return (3, None)
+
+    monkeypatch.setattr(scraper, "scrape_source", fake_scrape)
+    sources = [{"id": "dns"}, {"id": "blocked"}, {"id": "fine"}]
+    results = {"dns": (0, "Max retries exceeded: NameResolutionError"),
+               "blocked": (0, "HTTP 403"), "fine": (5, None)}
+    n = scraper._retry_transient_failures(results, sources, delay=0)
+    assert n == 1
+    assert calls == ["dns"]                      # 403 and healthy sources untouched
+    assert results["dns"] == (3, None)
+    assert results["blocked"] == (0, "HTTP 403")
+
+
+def test_retry_pass_is_noop_when_nothing_failed(monkeypatch):
+    monkeypatch.setattr(scraper, "scrape_source", lambda *a, **k: pytest.fail("must not run"))
+    assert scraper._retry_transient_failures({"a": (1, None)}, [{"id": "a"}], delay=0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Charset-less responses must not be decoded as Latin-1 (Hindi mojibake)
+# ---------------------------------------------------------------------------
+class _FakeResp:
+    def __init__(self, raw, ctype, apparent="utf-8"):
+        self.content = raw
+        self.headers = {"content-type": ctype}
+        self.apparent_encoding = apparent
+        self.text = raw.decode("latin-1")  # what requests does without a charset
+
+
+def test_html_text_decodes_utf8_when_charset_missing():
+    raw = "सहायक प्रोफेसर".encode()
+    assert scraper._html_text(_FakeResp(raw, "text/html")) == "सहायक प्रोफेसर"
+
+
+def test_html_text_honours_explicit_charset():
+    r = _FakeResp("café".encode("latin-1"), "text/html; charset=iso-8859-1")
+    r.text = "café"
+    assert scraper._html_text(r) == "café"
+
+
+def test_html_text_falls_back_to_detected_encoding():
+    raw = "café".encode("cp1252")
+    assert scraper._html_text(_FakeResp(raw, "text/html", "cp1252")) == "café"
