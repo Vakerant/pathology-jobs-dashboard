@@ -473,3 +473,29 @@ def iso_ago(days: float) -> str:
     """A full ISO timestamp `days` in the past, shaped like `first_seen`."""
     when = datetime.now(timezone.utc) - timedelta(days=days)
     return when.isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Display-only title cleanup (stored titles feed listing keys, so never edit them)
+# ---------------------------------------------------------------------------
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+@pytest.mark.parametrize("raw, expected", [
+    ("CLINICAL ASSOCIATE Clinical Associate - Uro-Oncology View View 30/11/2026 Download Apply",
+     "CLINICAL ASSOCIATE Clinical Associate - Uro-Oncology"),
+    ("07-11-2026 [General] List of Advocates empanelled for AIIMS Raipur View | Download (PDF, 1089.9 KB)",
+     "07-11-2026 [General] List of Advocates empanelled for AIIMS Raipur"),
+    ("Recruitment of Senior Residents at AIIMS, Jodhpur INDIA. View Document 24-09-2026 05-10-2026 Login Closed Online Result Download A",
+     "Recruitment of Senior Residents at AIIMS, Jodhpur INDIA."),
+    ("Recruitment of Senior Resident (Pathology)", "Recruitment of Senior Resident (Pathology)"),
+    ("Open Document ( 1.19 MB) View", "Open Document ( 1.19 MB)"),  # chrome-only: never blank a title
+])
+def test_clean_title_strips_row_chrome(raw, expected):
+    script = (
+        "const src=require('fs').readFileSync(process.argv[1],'utf8');"
+        "const g=n=>src.match(new RegExp('const '+n+'[^\\n]*\\n'))[0].replace('const ','var ');"
+        "eval(g('BTN')+g('TITLE_TAIL')+g('DOC_CHROME')+g('cleanTitle'));"
+        "console.log(JSON.stringify(cleanTitle(process.argv[2])));"
+    )
+    out = subprocess.run(["node", "-e", script, str(TEMPLATE), raw],
+                         capture_output=True, text=True, check=True).stdout
+    assert json.loads(out) == expected

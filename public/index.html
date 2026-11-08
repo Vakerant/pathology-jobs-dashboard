@@ -591,6 +591,16 @@ const $ = s => document.querySelector(s);
 const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 /* URLs come from third-party pages we scraped. Refuse anything that is not http(s). */
 const safeUrl = u => (/^https?:\/\//i.test(String(u || '')) ? String(u) : '#');
+// Scraped link text often ends with the page's button labels ("... View View
+// 30/11/2026 Download Apply"). Strip them for display only: stored titles are
+// untouched because listing keys are derived from them.
+const BTN = '(?:View|Download|Apply(?:\\s+Now)?|Click\\s+Here|Read\\s+More|Details)';
+const TITLE_TAIL = new RegExp('(?:\\s+' + BTN + ')+(?:\\s+\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4})?(?:\\s+' + BTN + ')*\\s*$', 'i');
+// Row chrome that starts at a document-link label ("View Document 24-09-2026 ...
+// Login Closed Online Result Download", "View | Download (PDF, 1.2 MB)",
+// "Open Document (1.19 MB)"): everything from that label onward is UI, not title.
+const DOC_CHROME = /\s+(?:View\s+Document|Open\s+Document|View\s*\|\s*Download)\b.*$/i;
+const cleanTitle = t => { const o = String(t == null ? '' : t); const c = o.replace(DOC_CHROME, '').replace(TITLE_TAIL, '').trim(); return c.length >= 8 ? c : o; };
 
 let DATA = {listings:[], status:[], stats:{}};
 let STATIC = false;
@@ -920,7 +930,7 @@ function card(l){
       (l.expired ? '<span class="tag closed">closed</span>' : '') +
       '<span class="age">' + TIER_LABEL[tier] + '</span>' +
     '</div>' +
-    '<h2 class="title"><a href="' + esc(safeUrl(l.url)) + '" target="_blank" rel="noopener noreferrer">' + esc(l.title) + '</a></h2>' +
+    '<h2 class="title"><a href="' + esc(safeUrl(l.url)) + '" target="_blank" rel="noopener noreferrer">' + esc(cleanTitle(l.title)) + '</a></h2>' +
     '<p class="prov">' +
       '<span class="org">' + esc(l.source_name) + '</span>' +
       '<span class="sep">/</span><span class="reg">' + esc(l.region || '—') + '</span>' +
