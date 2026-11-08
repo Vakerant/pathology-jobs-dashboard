@@ -665,4 +665,4 @@ if __name__ == "__main__":
     # Signal handlers are installed here rather than at import: under gunicorn
     # this block never runs, so we never clobber gunicorn's own handlers.
     _install_signal_handlers()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=False)

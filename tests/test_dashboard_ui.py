@@ -488,12 +488,16 @@ def iso_ago(days: float) -> str:
      "Recruitment of Senior Residents at AIIMS, Jodhpur INDIA."),
     ("Recruitment of Senior Resident (Pathology)", "Recruitment of Senior Resident (Pathology)"),
     ("Open Document ( 1.19 MB) View", "Open Document ( 1.19 MB)"),  # chrome-only: never blank a title
+    # UTF-8 bytes mis-decoded as Latin-1 (what stored AIIMS New Delhi rows look like)
+    ("भर्ती सूचना Recruitment Notice".encode().decode("latin-1"), "भर्ती सूचना Recruitment Notice"),
+    ("Café résumé notice for Senior Resident", "Café résumé notice for Senior Resident"),  # real accents untouched
 ])
 def test_clean_title_strips_row_chrome(raw, expected):
     script = (
         "const src=require('fs').readFileSync(process.argv[1],'utf8');"
         "const g=n=>src.match(new RegExp('const '+n+'[^\\n]*\\n'))[0].replace('const ','var ');"
-        "eval(g('BTN')+g('TITLE_TAIL')+g('DOC_CHROME')+g('cleanTitle'));"
+        "const fm=src.match(/const fixMojibake[\\s\\S]*?\\n};\\n/)[0].replace('const ','var ');"
+        "eval(g('BTN')+g('TITLE_TAIL')+g('DOC_CHROME')+fm+g('cleanTitle'));"
         "console.log(JSON.stringify(cleanTitle(process.argv[2])));"
     )
     out = subprocess.run(["node", "-e", script, str(TEMPLATE), raw],

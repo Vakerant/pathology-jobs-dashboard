@@ -600,7 +600,20 @@ const TITLE_TAIL = new RegExp('(?:\\s+' + BTN + ')+(?:\\s+\\d{1,2}[/.-]\\d{1,2}[
 // Login Closed Online Result Download", "View | Download (PDF, 1.2 MB)",
 // "Open Document (1.19 MB)"): everything from that label onward is UI, not title.
 const DOC_CHROME = /\s+(?:View\s+Document|Open\s+Document|View\s*\|\s*Download)\b.*$/i;
-const cleanTitle = t => { const o = String(t == null ? '' : t); const c = o.replace(DOC_CHROME, '').replace(TITLE_TAIL, '').trim(); return c.length >= 8 ? c : o; };
+// Rows scraped before the charset fix hold UTF-8 bytes that were decoded as
+// Latin-1 ("à¤\x9cà¥..." instead of Devanagari). Reverse that for display only;
+// anything that is not cleanly byte-shaped is returned unchanged.
+const fixMojibake = t => {
+  if (!/[\u00c2-\u00f4][\u0080-\u00bf]/.test(t)) return t;
+  const bytes = Array.from(t, ch => ch.charCodeAt(0));
+  if (bytes.some(b => b > 255)) return t;
+  // Titles are stored truncated, often mid-character, so decode leniently, drop
+  // the cut-off tail, and refuse the result if much of it is undecodable.
+  const out = new TextDecoder('utf-8').decode(Uint8Array.from(bytes)).replace(/\uFFFD+$/, '');
+  const bad = (out.match(/\uFFFD/g) || []).length;
+  return out && bad <= out.length * 0.05 ? out : t;
+};
+const cleanTitle = t => { const o = fixMojibake(String(t == null ? '' : t)); const c = o.replace(DOC_CHROME, '').replace(TITLE_TAIL, '').trim(); return c.length >= 8 ? c : o; };
 
 let DATA = {listings:[], status:[], stats:{}};
 let STATIC = false;

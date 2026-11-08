@@ -217,7 +217,10 @@ NEGATIVE = [
 # "pro-test", "grea-test", "fas-test" — and "Latest" appears on nearly every
 # government job portal's landing page, so the substring form silently threw
 # away real recruitment notices with no log line and no fallback.
-_NEGATIVE_WORD = re.compile(r"\b(?:test|price|package|cme|checkup|login|cart)\b", re.I)
+# Procurement is never a vacancy ("GEM tender for slide scanner ... Department of
+# Pathology" used to score "high" on the department name alone).
+_NEGATIVE_WORD = re.compile(
+    r"\b(?:test|price|package|cme|checkup|login|cart|tender|tenders|quotation|quotations|gem)\b", re.I)
 
 # Patterns in link text that indicate a false RECRUIT match.
 # These prevent words like "resident" inside "president" or
@@ -243,6 +246,27 @@ def _off_scope(text):
     return any(k in t for k in OFF_SCOPE_PATHS)
 
 
+# A pathology word on its own only proves a link is *about* pathology
+# ("Blood Bank", "Pathology Services", "Transfusion Medicine Event"), not that
+# it is a job. The "high" tier additionally needs one of these vacancy signals.
+_VACANCY_SIGNAL = re.compile(
+    r"recruit|vacanc|walk[\s-]?in|\bposts\b|\bpost\s+(?:of|for)\b|\bresidents?\b|"
+    r"\bfellow|faculty|professor|lecturer|tutor|demonstrator|consultant|"
+    r"medical officer|scientist|\bjob|career|opening|hiring|engagement|"
+    r"\badvt|advertisement|applications?\s+(?:are\s+)?invited|"
+    r"\bsrs?\b|\bjrs?\b|corrigendum|addendum",
+    re.I)
+
+
+def is_keyword_only_hit(text):
+    """True when ``text`` mentions pathology but carries no vacancy signal, or is
+    procurement. Such a link is a department page / tender, not a notice."""
+    t = (text or "").lower()
+    if not any(k in t for k in PATHOLOGY_KEYWORDS):
+        return False
+    return bool(_NEGATIVE_WORD.search(t)) or not _VACANCY_SIGNAL.search(t)
+
+
 def relevance(text):
     """Judge from the LINK's own text+href only (NOT shared row context)."""
     t = text.lower()
@@ -259,7 +283,7 @@ def relevance(text):
     # out of scope even though it is a genuine recruitment notice.
     if _off_scope(t):
         return None
-    if any(k in t for k in PATHOLOGY_KEYWORDS):
+    if any(k in t for k in PATHOLOGY_KEYWORDS) and _VACANCY_SIGNAL.search(t):
         return "high"
     if any(k in t for k in RECRUIT_KEYWORDS) and len(t) >= 12:
         return "medium"
@@ -861,6 +885,31 @@ def _retry_transient_failures(results, sources, delay=None):
     return recovered
 
 
+def rescore_stored():
+    """Demote stored "high" rows that only matched on a pathology word.
+
+    Rows written before the vacancy-signal rule (department pages, tenders,
+    event pages) keep their old "high" score until they age out, which can take
+    weeks. Non-destructive: they move to "medium" (hidden from "Pathology only"),
+    nothing is deleted, starred rows are never touched, and rows promoted because
+    a PDF body mentioned pathology are left alone (their title/url carry no
+    pathology word, so they are not keyword-only hits). Returns rows changed.
+    """
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT key, title, url FROM listings "
+            "WHERE relevance='high' AND is_seed=0 AND starred=0").fetchall()
+        keys = [(r["key"],) for r in rows
+                if is_keyword_only_hit(f"{r['title']} {r['url']}")]
+        if keys:
+            conn.executemany("UPDATE listings SET relevance='medium' WHERE key=?", keys)
+            conn.commit()
+        return len(keys)
+    finally:
+        conn.close()
+
+
 def run(verbose=True):
     global last_run_ok_sources
     last_run_ok_sources = None
@@ -904,6 +953,9 @@ def run(verbose=True):
             if verbose:
                 print(f"  ✓ {src['name']:<42} (+{new} new)")
     last_run_ok_sources = ok
+    rescored = rescore_stored()
+    if rescored:
+        log.info("re-scored %d stored keyword-only listing(s) high -> medium", rescored)
     pruned = db.prune_stale()
     # Keep the opportunity-first projection in step with the listing store.
     # Without this the mirror drifts (new listings never reach
