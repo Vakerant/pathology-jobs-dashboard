@@ -64,12 +64,25 @@ def test_ini_and_fellowship_coverage_is_present():
 
 
 def test_aiims_rishikesh_points_at_the_job_page():
-    """The old recruitment.html path yielded zero listings; job-new.php is the
-    page that actually lists SR vacancies."""
+    """The old recruitment.html path yielded zero listings. The site now lives
+    under /a1_1/, whose "New Job" page (page_id=2809) lists 11 SR notices
+    against 2 on the legacy job-new.php (checked 2026-11-10)."""
     src = next(s for s in sources.SOURCES if s["id"] == "aiims_rishikesh")
-    assert src["url"].endswith("/job-new.php"), (
+    assert not src["url"].endswith("/recruitment.html"), (
         f"aiims_rishikesh url regressed to the empty page: {src['url']}"
     )
+    assert "page_id=2809" in src["url"] or src["url"].endswith("/job-new.php")
+
+
+def test_every_aiims_is_tracked():
+    """The user asked for ALL AIIMS. Darbhanga is the only one left out, because
+    it had no reachable website when the list was compiled."""
+    names = " ".join(s["name"].lower() for s in sources.SOURCES if s["region"] == "INI – AIIMS")
+    for city in ("new delhi", "bhopal", "bhubaneswar", "jodhpur", "patna", "raipur",
+                 "rishikesh", "raebareli", "mangalagiri", "nagpur", "gorakhpur",
+                 "kalyani", "bathinda", "bibinagar", "deoghar", "bilaspur",
+                 "guwahati", "madurai", "rajkot", "jammu", "awantipora", "rewari"):
+        assert city in names, f"AIIMS {city} missing from SOURCES"
 
 
 # ---------------------------------------------------------------------------

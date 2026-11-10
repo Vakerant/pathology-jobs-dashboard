@@ -83,9 +83,9 @@ SOURCES = [
     # ---------------- DELHI ----------------
     {"id": "safdarjung", "name": "VMMC & Safdarjung Hospital", "region": "Delhi",
      "category": "Govt – Senior Resident", "url": "https://vmmc-sjh.mohfw.gov.in/recruitment"},
-    {"id": "aiims_delhi", "name": "AIIMS New Delhi (Recruitment)", "region": "Delhi / INI",
+    {"id": "aiims_delhi", "name": "AIIMS New Delhi (Recruitment)", "region": "INI – AIIMS",
      "category": "INI – Senior Resident", "url": "https://www.aiims.edu/index.php/en/notices/recruitment/aiims-recruitment"},
-    {"id": "aiims_exams", "name": "AIIMS Exams Portal", "region": "Delhi / INI",
+    {"id": "aiims_exams", "name": "AIIMS New Delhi (Exams Portal)", "region": "INI – AIIMS",
      "category": "INI – Senior Resident", "url": "https://www.aiimsexams.ac.in/"},
     {"id": "rml", "name": "RML Hospital, Delhi", "region": "Delhi",
      "category": "Govt – Senior Resident", "url": "https://rmlh.nic.in/index1.aspx?lsid=201&lev=2&lid=181&langid=1"},
@@ -124,27 +124,78 @@ SOURCES = [
     {"id": "uhsr_rohtak", "name": "PGIMS / UHS Rohtak", "region": "Haryana",
      "category": "Govt – Senior Resident", "url": "https://uhsr.ac.in/recruitment-advertisement"},
 
-    # ---------------- INSTITUTES OF NATIONAL IMPORTANCE ----------------
-    {"id": "aiims_bhopal", "name": "AIIMS Bhopal", "region": "INI – Other",
+    # ---------------- ALL AIIMS ----------------
+    # Every URL below was fetched on 2026-11-10 and run through scraper._collect;
+    # each one yields Senior Resident notices unless a comment says otherwise.
+    # Existing ids are unchanged (stored listings key on them).
+    {"id": "aiims_bhopal", "name": "AIIMS Bhopal", "region": "INI – AIIMS",
+     # The homepage carries the live /AIIMSFiles/career/ notice links.
      "category": "INI – Senior Resident", "url": "https://www.aiimsbhopal.edu.in/"},
-     {"id": "aiims_jodhpur", "name": "AIIMS Jodhpur", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/"},
-    {"id": "aiims_rishikesh", "name": "AIIMS Rishikesh", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsrishikesh.edu.in/job-new.php"},
-    {"id": "aiims_raipur", "name": "AIIMS Raipur (Chhattisgarh)", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsraipur.edu.in/"},
-    {"id": "aiims_nagpur", "name": "AIIMS Nagpur", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsnagpur.edu.in/recruitment"},
-    {"id": "aiims_guwahati", "name": "AIIMS Guwahati", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsguwahati.ac.in/"},
-    {"id": "aiims_raebareli", "name": "AIIMS Raebareli", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://aiimsrbl.edu.in/"},
-    {"id": "aiims_deoghar", "name": "AIIMS Deoghar (Jharkhand)", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://www.aiimsdeoghar.edu.in/notice/list"},
-    {"id": "aiims_bbsr", "name": "AIIMS Bhubaneswar", "region": "INI – Other",
+    {"id": "aiims_bbsr", "name": "AIIMS Bhubaneswar", "region": "INI – AIIMS",
      "category": "INI – Senior Resident", "url": "https://aiimsbhubaneswar.nic.in/recruitment-notice/"},
-    {"id": "aiims_bilaspur", "name": "AIIMS Bilaspur (HP)", "region": "INI – Other",
-     "category": "INI – Senior Resident", "url": "https://www.aiimsbilaspur.edu.in/recruitment"},
+    {"id": "aiims_jodhpur", "name": "AIIMS Jodhpur (Residents)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/residents-rec.php"},
+    {"id": "aiims_jodhpur_walkin", "name": "AIIMS Jodhpur (Walk-in SR)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/residents-rec-walkin.php"},
+    # AIIMS Patna sits behind a Sucuri JavaScript bot challenge: a plain HTTP
+    # client only ever receives the challenge page, so this source yields
+    # nothing until a JS-capable fetch is added. Kept so it shows in status.
+    {"id": "aiims_patna", "name": "AIIMS Patna", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimspatna.edu.in/"},
+    {"id": "aiims_raipur", "name": "AIIMS Raipur (Chhattisgarh)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsraipur.edu.in/user/recruitment.php"},
+    {"id": "aiims_rishikesh", "name": "AIIMS Rishikesh", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsrishikesh.edu.in/a1_1/?page_id=2809"},
+    {"id": "aiims_raebareli", "name": "AIIMS Raebareli", "region": "INI – AIIMS",
+     # Homepage, not /recruitments: the SR walk-in there is a javascript: link.
+     "category": "INI – Senior Resident", "url": "https://aiimsrbl.edu.in/"},
+    {"id": "aiims_mangalagiri", "name": "AIIMS Mangalagiri", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://www.aiimsmangalagiri.edu.in/recruitment/"},
+    {"id": "aiims_nagpur", "name": "AIIMS Nagpur", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsnagpur.edu.in/recruitment?category=SR/JR"},
+    {"id": "aiims_gorakhpur", "name": "AIIMS Gorakhpur", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsgorakhpur.edu.in/current-notices"},
+    # Kalyani and Rajkot are single-page apps (empty HTML); their notices come
+    # from JSON APIs. `kind: json` tells the scraper how to read them.
+    {"id": "aiims_kalyani", "name": "AIIMS Kalyani", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "kind": "json",
+     "url": "https://aiimskalyani.edu.in/aiimsapi/api/v1/recruitment?page_size=100",
+     "json": {"items": "items", "title": ["title", "position"], "url": "pdf_url",
+              "date": "publish_date", "deadline": "closing_date",
+              "base": "https://aiimskalyani.edu.in/aiimsapi"}},
+    {"id": "aiims_bathinda", "name": "AIIMS Bathinda", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsbathinda.edu.in/Recruitment.aspx?type=3"},
+    {"id": "aiims_bibinagar", "name": "AIIMS Bibinagar (Hyderabad)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsbibinagar.edu.in/"},
+    {"id": "aiims_deoghar", "name": "AIIMS Deoghar (Jharkhand)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://www.aiimsdeoghar.edu.in/recruitments/list"},
+    {"id": "aiims_bilaspur", "name": "AIIMS Bilaspur (HP)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident",
+     "url": "https://www.aiimsbilaspur.edu.in/recruitment/junior-residence-and-senior-residence"},
+    {"id": "aiims_guwahati", "name": "AIIMS Guwahati", "region": "INI – AIIMS",
+     # The /page/seniorresidents sub-page fills its list by script; the
+     # homepage carries the SR notice links server-side.
+     "category": "INI – Senior Resident", "url": "https://aiimsguwahati.ac.in/"},
+    {"id": "aiims_madurai", "name": "AIIMS Madurai", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsmadurai.edu.in/vacancy-notices.php"},
+    {"id": "aiims_rajkot", "name": "AIIMS Rajkot", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "kind": "json",
+     "url": "https://www.aiimsrajkot.edu.in/api/notices/getall",
+     "json": {"items": "", "title": ["notice_name"], "url": "notice_link",
+              "date": "entry_date", "deadline": "valid_to",
+              "base": "https://www.aiimsrajkot.edu.in"}},
+    {"id": "aiims_jammu", "name": "AIIMS Jammu (Vijaypur)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://www.aiimsjammu.edu.in/open-positions/"},
+    # AIIMS Awantipora's notice list renders client-side; the server-side HTML
+    # carries only a handful of links. Best available page, low yield.
+    {"id": "aiims_awantipora", "name": "AIIMS Awantipora (Kashmir)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://aiimsawantipora.edu.in/recruitment/"},
+    {"id": "aiims_rewari", "name": "AIIMS Rewari (Manethi)", "region": "INI – AIIMS",
+     "category": "INI – Senior Resident", "url": "https://www.aiimsrewari.edu.in/nonfaculty.html"},
+    # AIIMS Darbhanga: no reachable website as of 2026-11-10 (every candidate
+    # domain fails DNS). Add it here once the institute publishes one.
+
+    # ---------------- OTHER INSTITUTES OF NATIONAL IMPORTANCE ----------------
     {"id": "jipmer", "name": "JIPMER Puducherry", "region": "INI – Other",
      "category": "INI – Senior Resident", "url": "https://jipmer.edu.in/"},
     {"id": "nimhans", "name": "NIMHANS Bengaluru", "region": "INI – Other",

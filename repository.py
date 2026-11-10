@@ -161,6 +161,18 @@ _CITY_STATE = {
     "haridwar": "Uttarakhand",
     "rudrapur": "Uttarakhand",
     "almora": "Uttarakhand",
+    # added with the complete AIIMS list (2026-11)
+    "patna": "Bihar",
+    "mangalagiri": "Andhra Pradesh",
+    "gorakhpur": "Uttar Pradesh",
+    "kalyani": "West Bengal",
+    "bathinda": "Punjab",
+    "bibinagar": "Telangana",
+    "madurai": "Tamil Nadu",
+    "rajkot": "Gujarat",
+    "jammu": "Jammu & Kashmir",
+    "awantipora": "Jammu & Kashmir",
+    "rewari": "Haryana",
 }
 
 
