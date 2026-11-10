@@ -149,4 +149,6 @@ def run():
 
 
 if __name__ == "__main__":
+    import config
+    config.setup_logging()
     run()

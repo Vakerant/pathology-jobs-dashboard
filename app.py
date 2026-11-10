@@ -11,7 +11,10 @@ import time
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 
+from urllib.parse import urlsplit
+
 from flask import Flask, jsonify, render_template, request
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 import db
 import scraper
@@ -23,13 +26,15 @@ import config
 # ---------------------------------------------------------------------------
 # App & infra
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-)
+config.setup_logging()
 log = logging.getLogger("pathology-dashboard")
 
 app = Flask(__name__)
+if config.TRUST_PROXY:
+    # Behind a reverse proxy request.remote_addr is the proxy, which would put
+    # every client into one rate-limit bucket. Opt-in only: trusting
+    # X-Forwarded-* when no proxy sets them lets any client spoof its IP.
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024  # flag payload is tiny
 
 # _scrape_lock guards ONLY the atomic claim of the scrape slot. The scrape
@@ -137,6 +142,35 @@ def _consume_rate_limit(limit):
         if len(_RATE_BUCKETS) > _RATE_MAX_BUCKETS:
             for ip in list(_RATE_BUCKETS)[: len(_RATE_BUCKETS) - _RATE_MAX_BUCKETS]:
                 del _RATE_BUCKETS[ip]
+    return None
+
+
+def _same_origin(origin: str, host: str) -> bool:
+    """True when the ``Origin`` header's authority equals the request ``Host``."""
+    return urlsplit(origin).netloc.lower() == (host or "").lower()
+
+
+@app.before_request
+def _reject_cross_site_writes():
+    """Refuse browser-originated cross-site POSTs to the mutating endpoints.
+
+    Any web page the user visits can make their browser POST to this server
+    (e.g. a page on evil.example posting to http://localhost:5000/api/flag).
+    Browsers always attach ``Origin`` (and ``Sec-Fetch-Site``) to such
+    requests, so a mismatch is a reliable signal. Requests with *no* Origin
+    header (curl, scripts, tests) are not browser cross-site calls and are
+    allowed through; rate limiting still applies to them.
+
+    Registered before the rate limiter so rejected cross-site traffic cannot
+    consume a legitimate user's rate-limit budget.
+    """
+    if request.method != "POST" or request.path not in _RATE_LIMITED_PATHS:
+        return None
+    origin = request.headers.get("Origin")
+    cross_site = request.headers.get("Sec-Fetch-Site", "").lower() == "cross-site"
+    if cross_site or (origin and not _same_origin(origin, request.host)):
+        log.warning("cross-origin write rejected: %s origin=%r", request.path, origin)
+        return jsonify({"ok": False, "error": "cross-origin request rejected"}), 403
     return None
 
 
@@ -556,13 +590,18 @@ def api_flag():
     `starred` and `hidden` are stored on the SHARED `listings` table, so
     there is exactly one star set and one hidden set for the whole instance,
     not one per browser. Any client that can reach this endpoint can change
-    another visitor's stars/hides. The blast radius is bounded by three
-    things, and only those three:
+    another visitor's stars/hides. The blast radius is bounded by the
+    following, and only these:
 
       * the field allowlist -- only `starred` and `hidden` are writable;
       * key validation -- only real, existing 40-hex listing keys are
         addressable, so this cannot be used to write arbitrary columns;
-      * ADMIN_RATE_LIMIT (30/min/IP) in `_RATE_LIMITED_PATHS`.
+      * ADMIN_RATE_LIMIT (30/min/IP) in `_RATE_LIMITED_PATHS`;
+      * `_reject_cross_site_writes`, which refuses browser POSTs whose Origin
+        or Sec-Fetch-Site marks them as coming from another website (so a page
+        the user merely visits cannot drive this endpoint).
+
+    Non-browser clients that can reach the port are still unrestricted.
 
     Why it is not gated behind `config.ADMIN_SECRET`: the dashboard is a
     single static page, and the flag buttons live in that page's JavaScript.
@@ -626,4 +665,4 @@ if __name__ == "__main__":
     # Signal handlers are installed here rather than at import: under gunicorn
     # this block never runs, so we never clobber gunicorn's own handlers.
     _install_signal_handlers()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(host=config.FLASK_HOST, port=config.FLASK_PORT, debug=False)

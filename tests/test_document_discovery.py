@@ -70,6 +70,10 @@ class FakeResponse:
         self.text = text
         self.url = url
         self.status_code = status_code
+        # Mirror the attributes a real requests.Response always carries.
+        self.content = text.encode("utf-8")
+        self.headers = {"content-type": "text/html; charset=utf-8"}
+        self.apparent_encoding = "utf-8"
 
 
 class FakeSession:

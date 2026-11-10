@@ -17,6 +17,7 @@ from datetime import datetime, timezone, date
 from urllib.parse import urljoin, urlparse
 
 import requests
+import urllib3
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
@@ -45,7 +46,6 @@ if pypdf is not None:
 
 log = logging.getLogger("scraper")
 # Only suppress InsecureRequestWarning if insecure hosts are explicitly allowed
-import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 HEADERS = {
@@ -83,6 +83,23 @@ def _session():
     s.mount("http://", adapter)
     s.headers.update(HEADERS)
     return s
+
+def _html_text(resp):
+    """Decode a response body without trusting requests' Latin-1 default.
+
+    When a server omits ``charset`` from Content-Type, ``requests`` assumes
+    ISO-8859-1 per RFC 2616, which turns UTF-8 Hindi/Devanagari titles into
+    mojibake ("à¤à¥..."). AIIMS New Delhi hit this: 60 unreadable titles.
+    Honour an explicit charset; otherwise try UTF-8 first, then the detected one.
+    """
+    if "charset" in resp.headers.get("content-type", "").lower():
+        return resp.text
+    raw = resp.content
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(resp.apparent_encoding or "utf-8", errors="replace")
+
 
 # ---------------- date extraction ----------------
 _MONTHS = {m: i for i, m in enumerate(
@@ -200,7 +217,10 @@ NEGATIVE = [
 # "pro-test", "grea-test", "fas-test" — and "Latest" appears on nearly every
 # government job portal's landing page, so the substring form silently threw
 # away real recruitment notices with no log line and no fallback.
-_NEGATIVE_WORD = re.compile(r"\b(?:test|price|package|cme|checkup|login|cart)\b", re.I)
+# Procurement is never a vacancy ("GEM tender for slide scanner ... Department of
+# Pathology" used to score "high" on the department name alone).
+_NEGATIVE_WORD = re.compile(
+    r"\b(?:test|price|package|cme|checkup|login|cart|tender|tenders|quotation|quotations|gem)\b", re.I)
 
 # Patterns in link text that indicate a false RECRUIT match.
 # These prevent words like "resident" inside "president" or
@@ -226,6 +246,27 @@ def _off_scope(text):
     return any(k in t for k in OFF_SCOPE_PATHS)
 
 
+# A pathology word on its own only proves a link is *about* pathology
+# ("Blood Bank", "Pathology Services", "Transfusion Medicine Event"), not that
+# it is a job. The "high" tier additionally needs one of these vacancy signals.
+_VACANCY_SIGNAL = re.compile(
+    r"recruit|vacanc|walk[\s-]?in|\bposts\b|\bpost\s+(?:of|for)\b|\bresidents?\b|"
+    r"\bfellow|faculty|professor|lecturer|tutor|demonstrator|consultant|"
+    r"medical officer|scientist|\bjob|career|opening|hiring|engagement|"
+    r"\badvt|advertisement|applications?\s+(?:are\s+)?invited|"
+    r"\bsrs?\b|\bjrs?\b|corrigendum|addendum",
+    re.I)
+
+
+def is_keyword_only_hit(text):
+    """True when ``text`` mentions pathology but carries no vacancy signal, or is
+    procurement. Such a link is a department page / tender, not a notice."""
+    t = (text or "").lower()
+    if not any(k in t for k in PATHOLOGY_KEYWORDS):
+        return False
+    return bool(_NEGATIVE_WORD.search(t)) or not _VACANCY_SIGNAL.search(t)
+
+
 def relevance(text):
     """Judge from the LINK's own text+href only (NOT shared row context)."""
     t = text.lower()
@@ -242,7 +283,7 @@ def relevance(text):
     # out of scope even though it is a genuine recruitment notice.
     if _off_scope(t):
         return None
-    if any(k in t for k in PATHOLOGY_KEYWORDS):
+    if any(k in t for k in PATHOLOGY_KEYWORDS) and _VACANCY_SIGNAL.search(t):
         return "high"
     if any(k in t for k in RECRUIT_KEYWORDS) and len(t) >= 12:
         return "medium"
@@ -617,7 +658,7 @@ def _pdf_subject(text):
         return None
     m = _SUBJECT_RE.search(t)
     if m:
-        cand = _clean((m.group("labelled") or m.group("sentence") or "")).strip(" .;-–—")
+        cand = _clean(m.group("labelled") or m.group("sentence") or "").strip(" .;-–—")
         if len(cand) >= 15:
             return cand
     # Fall back to the first substantive chunk, flattened. Split only before an
@@ -719,7 +760,7 @@ def _collect(source_html, source_url, session):
         except Exception as exc:  # noqa: BLE001
             log.info("index %s -> %s", link, type(exc).__name__)
             continue
-        for it in _candidates(r.text, r.url):
+        for it in _candidates(_html_text(r), r.url):
             k = (it["title"].lower(), it["url"])
             if k in seen:
                 continue
@@ -740,7 +781,7 @@ def scrape_source(src, session=None):
         if http >= 400:
             db.record_status(src["id"], src["name"], src["region"], "failed", http, 0, f"HTTP {http}")
             return 0, f"HTTP {http}"
-        items = _collect(resp.text, resp.url, sess)
+        items = _collect(_html_text(resp), resp.url, sess)
         # PDF enrichment is best-effort and bounded: one unreadable document must
         # never take a whole source down.
         if pypdf is not None:
@@ -800,6 +841,75 @@ SCRAPE_WAIT_POLL_SECONDS = 5
 last_run_ok_sources = None
 
 
+# Errors that are worth one more attempt after the main pass: DNS hiccups,
+# timeouts and resets. Seen in production: five of seven "failed" sources
+# recovered on an immediate re-run, so a single flaky lookup was silently
+# dropping whole regions for a day. HTTP 4xx (403 bot-blocks, 404) is a
+# deliberate or permanent answer and is never retried.
+RETRY_PASS_DELAY = 15  # seconds to let DNS / upstream recover before retrying
+_TRANSIENT_MARKERS = ("max retries exceeded", "timed out", "timeout",
+                      "name resolution", "nameresolution", "temporary failure",
+                      "connection reset", "connection aborted", "connection refused")
+
+
+def _is_transient(err):
+    e = (err or "").lower()
+    if e.startswith("http 4"):
+        return False
+    return any(m in e for m in _TRANSIENT_MARKERS)
+
+
+def _retry_transient_failures(results, sources, delay=None):
+    """One more attempt for sources that failed transiently. Mutates ``results``."""
+    redo = [s for s in sources if _is_transient((results.get(s["id"]) or (0, ""))[1])]
+    if not redo:
+        return 0
+    wait = RETRY_PASS_DELAY if delay is None else delay
+    log.info("retrying %d source(s) after transient failure in %ss", len(redo), wait)
+    if wait:
+        time.sleep(wait)
+    recovered = 0
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(redo))) as pool:
+        futs = {pool.submit(scrape_source, s, _session()): s for s in redo}
+        for fut in as_completed(futs):
+            sid = futs[fut]["id"]
+            try:
+                res = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("source %s raised on retry: %s", sid, exc)
+                continue
+            if not res[1]:
+                recovered += 1
+            results[sid] = res
+    log.info("retry pass recovered %d/%d source(s)", recovered, len(redo))
+    return recovered
+
+
+def rescore_stored():
+    """Demote stored "high" rows that only matched on a pathology word.
+
+    Rows written before the vacancy-signal rule (department pages, tenders,
+    event pages) keep their old "high" score until they age out, which can take
+    weeks. Non-destructive: they move to "medium" (hidden from "Pathology only"),
+    nothing is deleted, starred rows are never touched, and rows promoted because
+    a PDF body mentioned pathology are left alone (their title/url carry no
+    pathology word, so they are not keyword-only hits). Returns rows changed.
+    """
+    conn = db.get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT key, title, url FROM listings "
+            "WHERE relevance='high' AND is_seed=0 AND starred=0").fetchall()
+        keys = [(r["key"],) for r in rows
+                if is_keyword_only_hit(f"{r['title']} {r['url']}")]
+        if keys:
+            conn.executemany("UPDATE listings SET relevance='medium' WHERE key=?", keys)
+            conn.commit()
+        return len(keys)
+    finally:
+        conn.close()
+
+
 def run(verbose=True):
     global last_run_ok_sources
     last_run_ok_sources = None
@@ -826,6 +936,7 @@ def run(verbose=True):
                 sid = futures[fut]["id"]
                 log.warning("source %s raised: %s", sid, exc)
                 results[sid] = (0, f"unhandled: {exc}"[:300])
+    _retry_transient_failures(results, SOURCES)
     for src in SOURCES:                      # report in registry order
         new, err = results.get(src["id"], (0, "no result returned"))
         total_new += new
@@ -842,6 +953,9 @@ def run(verbose=True):
             if verbose:
                 print(f"  ✓ {src['name']:<42} (+{new} new)")
     last_run_ok_sources = ok
+    rescored = rescore_stored()
+    if rescored:
+        log.info("re-scored %d stored keyword-only listing(s) high -> medium", rescored)
     pruned = db.prune_stale()
     # Keep the opportunity-first projection in step with the listing store.
     # Without this the mirror drifts (new listings never reach
@@ -949,4 +1063,5 @@ def main(verbose=True, wait_seconds=SCRAPE_WAIT_SECONDS) -> int:
 
 
 if __name__ == "__main__":
+    config.setup_logging()
     sys.exit(main(verbose="-q" not in sys.argv))

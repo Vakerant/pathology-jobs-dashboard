@@ -677,4 +677,6 @@ def main(argv: list[str]) -> int:
 
 
 if __name__ == "__main__":
+    import config
+    config.setup_logging()
     raise SystemExit(main(sys.argv[1:]))

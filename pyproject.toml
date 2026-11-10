@@ -1,0 +1,26 @@
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["venv", ".venv", "public"]
+
+[tool.ruff.lint]
+# Correctness-focused set: pyflakes, pycodestyle errors, bugbear, bandit-lite
+# (assert/exec/pickle etc.), and pyupgrade. Style-only rules are left off so the
+# gate catches real defects without churning working code.
+select = ["E4", "E7", "E9", "F", "B", "UP", "S102", "S301", "S307"]
+ignore = [
+    "E741",  # `l` for a listing row is used consistently across modules
+    "UP017", # datetime.timezone.utc is fine; datetime.UTC is purely cosmetic
+    "UP031", # %-format in a few log/format calls is fine
+    "B905",  # zip(strict=) not needed where lengths are equal by construction
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests (and conftest) set env vars before importing the app, so imports are
+# deliberately not at the top; one-line `commit(); close()` is fine in tests.
+"tests/*" = ["B011", "E402", "E702"]
+"conftest.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

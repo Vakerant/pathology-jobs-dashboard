@@ -12,6 +12,7 @@ Design rules:
 """
 from __future__ import annotations
 
+import logging
 import os
 import re
 from pathlib import Path
@@ -172,3 +173,16 @@ LLM_ENABLED = _env_bool("LLM_ENABLED", False) and LLM_API_KEY is not None
 FLASK_HOST = _env("FLASK_HOST", "127.0.0.1")
 FLASK_PORT = _env_int("FLASK_PORT", 5000)
 FLASK_DEBUG = _env_bool("FLASK_DEBUG", False)
+# Set to 1 only when running behind exactly one trusted reverse proxy (nginx,
+# Caddy, ...) so the rate limiter keys on the real client IP.
+TRUST_PROXY = _env_bool("PATHO_TRUST_PROXY", False)
+
+
+LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
+
+
+def setup_logging(level: int = logging.INFO) -> None:
+    """Configure root logging once. Safe to call repeatedly (basicConfig no-ops
+    when handlers already exist), so the web app and every CLI entry point can
+    share it. Without this, ``python seed.py`` etc. drop all INFO logs."""
+    logging.basicConfig(level=level, format=LOG_FORMAT)

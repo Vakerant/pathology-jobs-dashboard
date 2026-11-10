@@ -196,7 +196,7 @@ def _reliability_class(category: str) -> str | None:
 
 def _institution_id_from_source(src: dict) -> str:
     """Stable institution id keyed on the source (1 source -> 1 institution row)."""
-    return hashlib.sha1(f"inst|{src['id']}".encode("utf-8")).hexdigest()
+    return hashlib.sha1(f"inst|{src['id']}".encode()).hexdigest()
 
 
 def populate_institutions() -> int:
@@ -529,9 +529,9 @@ def record_event(event_type: str, opportunity_id: str | None,
     """
     payload = payload or {}
     idem = idempotency_hash or hashlib.sha1(
-        f"{event_type}|{opportunity_id}|{_jdump(payload)}".encode("utf-8")).hexdigest()
+        f"{event_type}|{opportunity_id}|{_jdump(payload)}".encode()).hexdigest()
     event_id = hashlib.sha1(
-        f"{idem}|{_now()}".encode("utf-8")).hexdigest()
+        f"{idem}|{_now()}".encode()).hexdigest()
     own = conn is None
     conn = conn or db.get_conn()
     try:
@@ -580,7 +580,7 @@ def upsert_application(opportunity_id: str, status: str,
                        checklist: list | None = None, notes: str | None = None) -> str:
     if status not in APPLICATION_STATUSES:
         raise ValueError(f"invalid application status: {status}")
-    app_id = hashlib.sha1(f"app|{opportunity_id}".encode("utf-8")).hexdigest()
+    app_id = hashlib.sha1(f"app|{opportunity_id}".encode()).hexdigest()
     conn = db.get_conn()
     try:
         conn.execute(

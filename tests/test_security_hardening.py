@@ -232,3 +232,61 @@ def test_scrape_source_filters_items_by_the_title_gate(monkeypatch, tmp_path):
     rows = [r[0] for r in sqlite3.connect(db.DB_PATH).execute("SELECT title FROM listings")]
     assert found == 1
     assert rows == ["Senior Resident (Pathology) at AIIMS Bhopal"]
+
+# ---------------------------------------------------------------------------
+# Cross-site write guard, digest link safety, opt-in proxy trust
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("path", ["/api/flag", "/api/refresh"])
+def test_cross_origin_post_is_rejected(path):
+    c = app_module.app.test_client()
+    r = c.post(path, json={}, headers={"Origin": "http://evil.example"})
+    assert r.status_code == 403
+    assert r.get_json()["error"] == "cross-origin request rejected"
+
+
+def test_sec_fetch_site_cross_site_is_rejected():
+    c = app_module.app.test_client()
+    r = c.post("/api/flag", json={}, headers={"Sec-Fetch-Site": "cross-site"})
+    assert r.status_code == 403
+
+
+def test_same_origin_and_headerless_posts_are_not_blocked_by_guard():
+    c = app_module.app.test_client()
+    same = c.post("/api/flag", json={}, headers={"Origin": "http://localhost"})
+    bare = c.post("/api/flag", json={})
+    # Passes the guard and is rejected later by payload validation (400), not 403.
+    assert same.status_code == 400
+    assert bare.status_code == 400
+
+
+def test_cross_origin_does_not_consume_rate_limit(monkeypatch):
+    monkeypatch.setitem(app_module._RATE_LIMITED_PATHS, "/api/flag", 2)
+    c = app_module.app.test_client()
+    for _ in range(5):
+        assert c.post("/api/flag", json={},
+                      headers={"Origin": "http://evil.example"}).status_code == 403
+    assert c.post("/api/flag", json={}).status_code == 400  # budget intact
+
+
+@pytest.mark.parametrize("url", ["javascript:alert(1)", "data:text/html,x", "  JavaScript:x"])
+def test_digest_does_not_link_non_http_urls(url):
+    import alerts
+    out = alerts._digest_html([{"region": "R", "url": url, "title": "T",
+                                "source_name": "S", "category": "C"}])
+    # The footer carries one static dashboard link; the listing must add none.
+    assert out.count("<a ") == 1
+    assert url.strip().lower() not in out.lower()
+    assert ">T</span>" in out
+
+
+def test_digest_links_http_urls():
+    import alerts
+    out = alerts._digest_html([{"region": "R", "url": "https://x.gov.in/a?b=1&c=2",
+                                "title": "T", "source_name": "S", "category": "C"}])
+    assert 'href="https://x.gov.in/a?b=1&amp;c=2"' in out
+
+
+def test_proxy_trust_is_off_by_default():
+    assert config.TRUST_PROXY is False
+    from werkzeug.middleware.proxy_fix import ProxyFix
+    assert not isinstance(app_module.app.wsgi_app, ProxyFix)
