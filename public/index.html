@@ -553,9 +553,8 @@ select:hover{border-color:var(--hemat)}
       </label>
       <label class="sr-only" for="rel">Relevance</label>
       <select id="rel">
-        <option value="high">Pathology only</option>
-        <option value="medium">Any relevance</option>
-        <option value="">Everything</option>
+        <option value="high">MD Pathology SR / Fellowship</option>
+        <option value="possible">+ multi-department SR notices to check</option>
       </select>
       <label class="sr-only" for="sort">Sort</label>
       <select id="sort">
@@ -730,7 +729,10 @@ function inScope(l){
   if($('#newonly').checked && !l.is_new) return false;
   if($('#staronly').checked && !l.starred) return false;
   const rel = $('#rel').value;
-  if(rel && l.relevance !== rel) return false;
+  // 'high' = confirmed MD Pathology SR / fellowship; 'possible' also shows
+  // multi-department SR notices whose pathology seat could not be confirmed.
+  if(rel === 'high' && l.relevance !== 'high') return false;
+  if(rel === 'possible' && l.relevance !== 'high' && l.relevance !== 'medium') return false;
   if(active.region.size && !active.region.has(l.region)) return false;
   if(active.cat.size && !active.cat.has(l.category)) return false;
   if(active.doc.size && !active.doc.has(l.document_type)) return false;
@@ -938,8 +940,8 @@ function card(l){
       (actionable ? ' data-doc="' + esc(doc) + '"' : '') + '>' +
     '<div class="card-head">' +
       (actionable ? '<span class="doc" data-doc="' + esc(doc) + '">' + esc(DOC_LABELS[doc] || doc) + '</span>' : '') +
-      (l.relevance === 'high' ? '<span class="tag hi">pathology</span>' : '') +
-      (l.is_seed ? '<span class="tag curated">curated</span>' : '') +
+      (l.relevance === 'high' ? '<span class="tag hi">MD Path SR / Fellow</span>' :
+       l.relevance === 'medium' ? '<span class="tag curated">multi-dept · check PDF for pathology</span>' : '') +
       (l.expired ? '<span class="tag closed">closed</span>' : '') +
       '<span class="age">' + TIER_LABEL[tier] + '</span>' +
     '</div>' +
