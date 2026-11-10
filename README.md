@@ -36,8 +36,16 @@ A static mirror is deployed to **https://pathology-tracker.vercel.app** — open
 on your phone. It shows the same data, updated daily. Star/hide on the mirror are
 saved in that browser (local storage). "Update now" only works on the desktop app.
 
-The daily pipeline rebuilds `public/` and redeploys it automatically. To redeploy
-by hand: `cd public && vercel deploy --prod --yes`.
+**How the site gets its data.** This laptop is the scraper of record: its daily
+timer scrapes, rebuilds `public/`, commits it and **pushes to GitHub `main`**;
+Vercel auto-deploys from GitHub. The laptop scrapes because many Indian
+government sites (AIIMS Bhopal, Jodhpur, Guwahati, Rajkot, ...) time out for
+GitHub's US-hosted runners but answer from India. There is exactly one deploy
+path (GitHub → Vercel) — never `vercel deploy` from here, which made the site
+flip between two datasets.
+
+To publish right now: `systemctl --user start pathology-scrape.service`
+(watch `tail -f scrape.log`).
 
 ## 📧 Email alerts for NEW pathology posts
 You get an email **only when a genuinely new pathology post appears** (high-relevance
@@ -64,9 +72,11 @@ Until you do this, alerts are simply skipped (everything else still runs).
    own whenever the data is older than 6 h.
 3. **↻ Update now** — on-demand from the dashboard.
 
-The pipeline: seed → scrape (parallel, with retries) → email new pathology posts →
-prune stale listings → **re-sync the opportunity projection** → rebuild static →
-redeploy to Vercel. Logs go to `scrape.log` (auto-trimmed). The UI shows a ⚠️
+The pipeline: fast-forward to `origin/main` → seed → scrape (parallel, with retries)
+→ email new pathology posts → prune stale listings → **re-sync the opportunity
+projection** → rebuild static → **commit `public/` and push to GitHub** (Vercel
+deploys it). Publishing is skipped when the scrape or export failed, and when the
+checkout is not on `main`. Logs go to `scrape.log` (auto-trimmed). The UI shows a ⚠️
 banner whenever data is older than 24 h.
 
 ## Scraping feedback
@@ -115,8 +125,12 @@ junk filter — otherwise the one link worth following is the one link dropped.
 ## Tests & CI
 `./venv/bin/python -m pytest tests/ -q` — 271 tests, no network, ~14 s.
 
-`.github/workflows/daily-scrape.yml` runs a `test` job (compile + pytest) that the
-scheduled `scrape` job depends on, so a failing test blocks the publish instead
+`.github/workflows/daily-scrape.yml` runs a `test` job (compile + pytest) on every
+push and PR. A push to `main` also refreshes `public/index.html` from the template
+(`publish-ui`), so dashboard changes go live without waiting for the laptop. The
+`scrape` job is a **fallback**: its 12:30 IST schedule only scrapes when the
+laptop's last publish is more than 36 h old (a manual "Run workflow" always
+scrapes), and it depends on `test`, so a failing test blocks the publish instead
 of shipping a bad static mirror. The scrape job also re-verifies the
 opportunity/listing projection invariant and fails the build rather than
 committing drifting data — see ARCHITECTURE.md §4.

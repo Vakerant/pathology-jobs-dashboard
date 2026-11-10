@@ -11,8 +11,12 @@ on:
   # so every PR used to show a red scrape job.
   pull_request:
   schedule:
-    # 08:00 IST = 02:30 UTC daily
-    - cron: "30 2 * * *"
+    # FALLBACK ONLY. The laptop's 08:00 IST timer (run_daily.sh) is the
+    # scraper of record and pushes public/ itself: many Indian government
+    # sites time out for GitHub's US runners. This 12:30 IST check scrapes
+    # only when the laptop's last publish is more than 36h old.
+    - cron: "0 7 * * *"
+  # Manual "Run workflow" always scrapes (an explicit request).
   workflow_dispatch: {}
 
 permissions:
@@ -55,11 +59,67 @@ jobs:
       - name: Run unit tests
         run: python -m pytest tests/ -q
 
-  # ── Publish ───────────────────────────────────────────────────────────────
-  scrape:
+  # ── Is the laptop's published data stale? ─────────────────────────────────
+  freshness:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      stale: ${{ steps.check.outputs.stale }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: check
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          from datetime import datetime, timezone
+          if os.environ["EVENT"] == "workflow_dispatch":
+              print("stale=true"); raise SystemExit
+          try:
+              last = json.load(open("public/data.json"))["stats"]["last_run"]
+              age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds() / 3600
+          except Exception:
+              age_h = 1e9
+          print(f"stale={'true' if age_h > 36 else 'false'}")
+          PY
+          cat "$GITHUB_OUTPUT"
+        env:
+          EVENT: ${{ github.event_name }}
+
+  # ── UI-only publish on code pushes ────────────────────────────────────────
+  # Data comes from the laptop, but a dashboard change pushed to main should go
+  # live now, not at the laptop's next run. public/index.html is a plain copy
+  # of templates/dashboard.html, so refresh just that file.
+  publish-ui:
     needs: test
-    # Never publish from a pull request (detached HEAD -> `git push` fails).
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Copy the dashboard template into the mirror
+        run: |
+          cp templates/dashboard.html public/index.html
+          if git diff --quiet -- public/index.html; then
+            echo "public/index.html already current"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add public/index.html
+          git commit -m "chore: refresh dashboard page [skip ci]"
+          git push
+
+  # ── Publish (fallback scrape) ─────────────────────────────────────────────
+  scrape:
+    needs: [test, freshness]
+    # Only when the laptop has not published for 36h (or on a manual run).
+    # Never on push / pull_request: two scrapers publishing would flip the
+    # live site between two different datasets.
+    if: needs.freshness.outputs.stale == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -122,7 +182,7 @@ jobs:
             echo "No changes to commit"
             exit 0
           fi
-          git commit -m "chore: daily scrape ${{ env.listings }} listings [skip ci]"
+          git commit -m "chore: CI fallback scrape ${{ env.listings }} listings [skip ci]"
           git push
 
       - name: Summary
