@@ -182,7 +182,10 @@ def test_cleanup_stored_applies_the_current_rules(tmp_path, monkeypatch):
     today = date(2026, 11, 10)
     db.upsert_listings([{**base, "source_id": "gone", "title": "Walk-in interview Senior Resident Pathology (old source)",
                          "url": "https://x/z", "relevance": "high"}])
+    db.record_status("gone", "Removed source", "R", "failed", 0, 0, "timeout")
+    db.record_status("s", "S", "R", "ok", 200, 1, "")
     deleted, changed = scraper.cleanup_stored(today, source_ids={"s"})
+    assert {s["source_id"] for s in db.fetch_status()} == {"s"}
     got = {r["title"]: r["relevance"] for r in db.fetch_listings()}
     assert got == {
         "Walk-in interview Senior Resident Pathology": "high",

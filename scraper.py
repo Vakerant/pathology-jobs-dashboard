@@ -1015,6 +1015,12 @@ def cleanup_stored(today=None, source_ids=None):
                      "SELECT 1 FROM listings l WHERE l.source_id = d.source_id AND l.url = d.url)")
         conn.execute(f"DELETE FROM document_versions WHERE document_id IN ({dead_docs})")
         conn.execute(f"DELETE FROM documents WHERE document_id IN ({dead_docs})")
+        # A source removed from sources.SOURCES must not linger in the
+        # dashboard's source status list (as "failed", forever).
+        if tracked:
+            marks = ",".join("?" * len(tracked))
+            conn.execute(f"DELETE FROM source_status WHERE source_id NOT IN ({marks})",
+                         tuple(tracked))
         conn.commit()
         return len(drop), len(change)
     finally:
