@@ -384,7 +384,7 @@ def test_fetch_unalerted_pathology_skips_expired_deadlines(tmp_path, monkeypatch
 # ---------------------------------------------------------------------------
 def test_relevance_keeps_latest_but_rejects_the_real_negatives():
     assert scraper.relevance("Latest News - Recruitment for Senior Resident in Pathology") == "high"
-    assert scraper.relevance("latest circular - pathology vacancies") == "high"
+    assert scraper.relevance("latest circular - Senior Resident pathology vacancies") == "high"
     # 'test' only appears here as the tail of "protest"
     assert scraper.relevance("Protest against the new policy") is None
     assert scraper.relevance("Unit Test Results for SR exam") is None

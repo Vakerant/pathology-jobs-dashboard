@@ -135,8 +135,8 @@ SOURCES = [
      "category": "INI – Senior Resident", "url": "https://aiimsbhubaneswar.nic.in/recruitment-notice/"},
     {"id": "aiims_jodhpur", "name": "AIIMS Jodhpur (Residents)", "region": "INI – AIIMS",
      "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/residents-rec.php"},
-    {"id": "aiims_jodhpur_walkin", "name": "AIIMS Jodhpur (Walk-in SR)", "region": "INI – AIIMS",
-     "category": "INI – Senior Resident", "url": "https://aiimsjodhpur.edu.in/residents-rec-walkin.php"},
+    # residents-rec-walkin.php serves the same notice list as residents-rec.php,
+    # so it is not tracked separately (it only duplicated every listing).
     # AIIMS Patna sits behind a Sucuri JavaScript bot challenge: a plain HTTP
     # client only ever receives the challenge page, so this source yields
     # nothing until a JS-capable fetch is added. Kept so it shows in status.
@@ -159,7 +159,7 @@ SOURCES = [
     # from JSON APIs. `kind: json` tells the scraper how to read them.
     {"id": "aiims_kalyani", "name": "AIIMS Kalyani", "region": "INI – AIIMS",
      "category": "INI – Senior Resident", "kind": "json",
-     "url": "https://aiimskalyani.edu.in/aiimsapi/api/v1/recruitment?page_size=100",
+     "url": "https://aiimskalyani.edu.in/aiimsapi/api/v1/recruitment?page_size=50",
      "json": {"items": "items", "title": ["title", "position"], "url": "pdf_url",
               "date": "publish_date", "deadline": "closing_date",
               "base": "https://aiimskalyani.edu.in/aiimsapi"}},

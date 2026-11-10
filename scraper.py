@@ -24,7 +24,8 @@ from bs4 import BeautifulSoup
 
 import db
 import config
-from sources import (SOURCES, RECRUIT_KEYWORDS, PATHOLOGY_KEYWORDS, JUNK_TITLES,
+import scope
+from sources import (SOURCES, PATHOLOGY_KEYWORDS, JUNK_TITLES,
                     OFF_SCOPE_PATHS)
 
 # PDF text extraction is an optional capability: the scraper must keep working
@@ -267,27 +268,25 @@ def is_keyword_only_hit(text):
     return bool(_NEGATIVE_WORD.search(t)) or not _VACANCY_SIGNAL.search(t)
 
 
-def relevance(text):
-    """Judge from the LINK's own text+href only (NOT shared row context)."""
-    t = text.lower()
-    if any(n in t for n in NEGATIVE):
+def relevance(text, href=""):
+    """Is this link an MD Pathology Senior Resident / fellowship notice?
+
+    "high" = names a pathology discipline, "medium" = SR / fellowship notice
+    whose department is unnamed or "various", None = not for this user.
+    The rules live in scope.py. The generic junk gates below (procurement,
+    "President" navigation, roster links) run first."""
+    t = f"{text or ''} {href or ''}"
+    if _NEGATIVE_WORD.search(t) or _NEGATIVE_EXACT.search(t):
         return None
-    # Whole-word pass for the short generic tokens (test/price/package/cme/…).
-    # Must run on the lowercased text with word boundaries so "Latest News"
-    # survives while a genuine "test" link is still rejected.
-    if _NEGATIVE_WORD.search(t):
-        return None
-    if _NEGATIVE_EXACT.search(t):
-        return None
-    # Strict scope: MD pathology only. An oral/dental/veterinary notice is
-    # out of scope even though it is a genuine recruitment notice.
-    if _off_scope(t):
-        return None
-    if any(k in t for k in PATHOLOGY_KEYWORDS) and _VACANCY_SIGNAL.search(t):
-        return "high"
-    if any(k in t for k in RECRUIT_KEYWORDS) and len(t) >= 12:
-        return "medium"
-    return None
+    return scope.judge(text, href)
+
+
+# A document link whose own text says nothing ("View", "Advertisement (450 KB)")
+# can still be the notice. It is kept as "pending" only long enough for its PDF
+# body to be read; whatever the body does not confirm is dropped.
+_DOC_HINT = re.compile(r"advert|\badvt|recruit|vacan|walk[\s-]*in|notice|notification|"
+                       r"^\s*(?:view|download|open)\b|document", re.I)
+PENDING = "pending"
 
 
 # document_type values MUST mirror the documents.document_type enum defined in
@@ -356,12 +355,23 @@ def _candidates(html, base_url):
         url = urljoin(base_url, href)
         if any(h in url.lower() for h in BAD_HOSTS):
             continue
-        rel = relevance(f"{title} {href}")   # link's own signal only
-        if not rel:
-            continue
         ctx = _row_text(a)
         if any(n in ctx.lower() for n in ("total visitor", "all rights reserved")):
             continue
+        # Judge the link's own text. A bare button ("View", "Download") borrows
+        # its row's text instead -- but only a short row: _row_text can climb
+        # to a whole <div> holding dozens of unrelated notices.
+        judged = title
+        if (title.lower() in JUNK_TITLES or len(title) < 5) and ctx and len(ctx) <= 300:
+            judged = ctx
+        rel = relevance(judged, href)
+        if not rel:
+            # The hint is read from the visible text only: every PDF href
+            # ends in ".pdf", which says nothing about what the document is.
+            if not (_is_pdf(url) and _DOC_HINT.search(judged)
+                    and not scope.DROP.search(judged) and not scope.OFF_SCOPE.search(judged)):
+                continue
+            rel = PENDING
         # Pick a meaningful title: prefer the row context if the link text is junk.
         disp = title
         if title.lower() in JUNK_TITLES or len(title) < 5:
@@ -408,7 +418,7 @@ def _candidates(html, base_url):
 MAX_INDEX_FOLLOWS = 3      # per source; each costs one more request
 MAX_PDF_BYTES = 12 * 1024 * 1024
 MAX_PDF_PAGES = 8
-MAX_PDF_ENRICH = 12        # per source; PDF parsing is the expensive part
+MAX_PDF_ENRICH = 20        # per source; PDF parsing is the expensive part
 
 # A link is worth following as an index only if its text or href smells like a
 # recruitment landing page. Deliberately narrow — see _index_links().
@@ -618,10 +628,7 @@ def _mentions_pathology(text):
     wrong for a *document body*. A recruitment notice whose text names a
     pathology department is relevant to a pathologist no matter what else the
     notice contains."""
-    t = (text or "").lower()
-    if _off_scope(t):
-        return False
-    return any(k in t for k in PATHOLOGY_KEYWORDS)
+    return scope.mentions_pathology(text)
 
 
 def _pathology_sentence(text, width=180):
@@ -632,10 +639,10 @@ def _pathology_sentence(text, width=180):
         return None
     if _off_scope(t):
         return None
-    low = t.lower()
-    best = min((low.find(k) for k in PATHOLOGY_KEYWORDS if k in low), default=-1)
-    if best < 0:
+    m = scope.PATHOLOGY.search(t)
+    if not m:
         return None
+    best = m.start()
     start = max(0, best - 40)
     # Snap forward to the next space so the snippet never starts mid-word.
     # Adding a fixed 1 here only ever advanced the cut by a single character,
@@ -691,12 +698,14 @@ def _pdf_deadline(text, window=120):
 
 
 def _enrich_from_pdf(item, session):
-    """Promote a document-link candidate using the document's own text.
+    """Re-judge a document-link candidate on the document's own text.
 
-    Only ever ADDS signal: relevance is promoted high when the body names a
-    pathology department, an uninformative title is replaced by the notice's
-    real subject, and a snippet/deadline is filled in. A document that says
-    nothing about pathology is left exactly as it was."""
+    The body is the evidence: a body naming a pathology discipline (in an SR /
+    fellowship notice) confirms the item as "high", replaces an uninformative
+    title with the notice's real subject and fills snippet/deadline. A body
+    that was read but names no pathology discipline sets rel to None -- that
+    notice is for other departments. An unreadable body (scanned image, failed
+    download) leaves the item as it was."""
     url = item.get("url") or ""
     if not _is_pdf(url):
         return False
@@ -704,8 +713,9 @@ def _enrich_from_pdf(item, session):
     if not body:
         return False
     changed = False
-    if not _mentions_pathology(body):
-        return False
+    if scope.judge_document(item.get("title") or "", body) != "high":
+        item["rel"] = None
+        return True
     subject = _pdf_subject(body)
     if subject and (not item.get("title") or item["title"].lower() in JUNK_TITLES):
         item["title"] = db.strip_serial(subject)[:240]
@@ -769,6 +779,55 @@ def _collect(source_html, source_url, session):
     return items[:MAX_ITEMS_PER_SOURCE]
 
 
+def _json_candidates(resp, src):
+    """Candidates from a JSON notice API (sources with ``kind: "json"``).
+
+    Some institutes (AIIMS Kalyani, AIIMS Rajkot) publish single-page apps whose
+    HTML is an empty shell; their notices only exist in the API the app calls.
+    ``src["json"]`` maps the API's field names: ``items`` (dotted path to the
+    list, "" for a top-level list), ``title`` (fields tried in order), ``url``,
+    ``date``, ``deadline`` and ``base`` (prefix for root-relative links)."""
+    spec = src.get("json") or {}
+    data = resp.json()
+    for part in filter(None, (spec.get("items") or "").split(".")):
+        data = (data or {}).get(part)
+    if not isinstance(data, list):
+        return []
+    base = (spec.get("base") or src["url"]).rstrip("/")
+    out, seen = [], set()
+    for row in data:
+        if not isinstance(row, dict):
+            continue
+        title = next((_clean(str(row[k])) for k in spec.get("title", [])
+                      if row.get(k) not in (None, "", "None")), "")
+        link = str(row.get(spec.get("url", "")) or "").strip()
+        if len(title) < 10 or not link or link == "None":
+            continue
+        url = requests.utils.requote_uri(link if link.startswith("http") else
+                                         f"{base}/{link.lstrip('/')}")
+        rel = relevance(title, url)
+        if not rel:
+            if not (_is_pdf(url) and _DOC_HINT.search(title) and not scope.DROP.search(title)):
+                continue
+            rel = PENDING
+        key = (title.lower(), url)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"title": db.strip_serial(title)[:240], "url": url, "rel": rel,
+                    "notice_date": _json_day(row, spec.get("date")),
+                    "deadline": _json_day(row, spec.get("deadline")),
+                    "document_type": classify_document_type(title)})
+    return out[:MAX_ITEMS_PER_SOURCE]
+
+
+def _json_day(row, field):
+    """ISO date (YYYY-MM-DD) from a JSON row's timestamp field, or None."""
+    v = row.get(field) if field else None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(v or ""))
+    return f"{m.group(1)}-{m.group(2)}-{m.group(3)}" if m else None
+
+
 def scrape_source(src, session=None):
     new_count = 0
     sess = session or _session()
@@ -781,12 +840,20 @@ def scrape_source(src, session=None):
         if http >= 400:
             db.record_status(src["id"], src["name"], src["region"], "failed", http, 0, f"HTTP {http}")
             return 0, f"HTTP {http}"
-        items = _collect(_html_text(resp), resp.url, sess)
+        if src.get("kind") == "json":
+            items = _json_candidates(resp, src)
+        else:
+            items = _collect(_html_text(resp), resp.url, sess)
         # PDF enrichment is best-effort and bounded: one unreadable document must
-        # never take a whole source down.
+        # never take a whole source down. The budget goes first to the documents
+        # whose verdict depends on it: multi-department SR notices ("medium",
+        # where the PDF says whether pathology has a seat) and bare document
+        # links ("pending"). A title that already names pathology is enriched
+        # last, only for its snippet and deadline.
         if pypdf is not None:
+            order = {"medium": 0, PENDING: 1, "high": 2}
             budget = MAX_PDF_ENRICH
-            for it in items:
+            for it in sorted(items, key=lambda x: order.get(x.get("rel"), 3)):
                 if budget <= 0:
                     break
                 if not _is_pdf(it.get("url", "")):
@@ -796,6 +863,13 @@ def scrape_source(src, session=None):
                     _enrich_from_pdf(it, sess)
                 except Exception as exc:  # noqa: BLE001
                     log.info("pdf enrich failed %s: %s", it.get("url"), type(exc).__name__)
+        today = date.today()
+        # Keep only what is now confirmed or plausibly an SR / fellowship
+        # notice. "pending" items whose document was never read are dropped,
+        # and so are notices whose every mentioned year has passed.
+        items = [it for it in items
+                 if it.get("rel") in ("high", "medium")
+                 and not scope.is_stale(it.get("title", ""), today)]
         found = 0
         # Collect first, persist as one batch: upsert_listings() shares a single
         # connection and commits once, instead of opening/committing/closing a
@@ -885,27 +959,64 @@ def _retry_transient_failures(results, sources, delay=None):
     return recovered
 
 
-def rescore_stored():
-    """Demote stored "high" rows that only matched on a pathology word.
+def stored_verdict(title, url, snippet, today):
+    """The current rules' verdict on an already-stored listing.
 
-    Rows written before the vacancy-signal rule (department pages, tenders,
-    event pages) keep their old "high" score until they age out, which can take
-    weeks. Non-destructive: they move to "medium" (hidden from "Pathology only"),
-    nothing is deleted, starred rows are never touched, and rows promoted because
-    a PDF body mentioned pathology are left alone (their title/url carry no
-    pathology word, so they are not keyword-only hits). Returns rows changed.
+    A stored row has no PDF body any more, but `_enrich_from_pdf` only ever
+    wrote a snippet that is a pathology sentence from the body. So a snippet
+    naming pathology is the body's evidence and confirms an SR / fellowship
+    notice whose title alone did not."""
+    if scope.is_mojibake(title) or scope.is_stale(title, today):
+        return None
+    v = relevance(title, url)
+    if v != "high" and snippet and scope.mentions_pathology(snippet):
+        if scope.judge_document(title, f"{title} {snippet}") == "high":
+            return "high"
+    return v
+
+
+def cleanup_stored(today=None, source_ids=None):
+    """Bring every stored listing in line with the current rules.
+
+    The CI pipeline restores yesterday's database, so rows scored by older,
+    looser rules (and the placeholder seeds) would otherwise linger for weeks.
+    Every non-starred row is re-judged: rows the rules now reject are deleted,
+    the rest get their new relevance. Also deleted: seed placeholders and
+    titles stored as mojibake (UTF-8 read as Latin-1); a listing key is derived
+    from its title, so a garbled row cannot be repaired in place -- the next
+    scrape, which decodes correctly, re-adds the real notice. Rows from a
+    source no longer in sources.SOURCES go too. Starred rows are the user's
+    own and are never touched. Idempotent. Returns (deleted, changed).
     """
+    today = today or date.today()
+    tracked = source_ids if source_ids is not None else {s["id"] for s in SOURCES}
     conn = db.get_conn()
     try:
         rows = conn.execute(
-            "SELECT key, title, url FROM listings "
-            "WHERE relevance='high' AND is_seed=0 AND starred=0").fetchall()
-        keys = [(r["key"],) for r in rows
-                if is_keyword_only_hit(f"{r['title']} {r['url']}")]
-        if keys:
-            conn.executemany("UPDATE listings SET relevance='medium' WHERE key=?", keys)
-            conn.commit()
-        return len(keys)
+            "SELECT key, source_id, title, url, snippet, relevance, is_seed FROM listings "
+            "WHERE starred=0").fetchall()
+        drop, change = [], []
+        for r in rows:
+            v = None if r["is_seed"] or r["source_id"] not in tracked else stored_verdict(
+                r["title"] or "", r["url"] or "", r["snippet"] or "", today)
+            if v is None:
+                drop.append((r["key"],))
+            elif v != r["relevance"]:
+                change.append((v, r["key"]))
+        if drop:
+            conn.executemany("DELETE FROM listings WHERE key=?", drop)
+        if change:
+            conn.executemany("UPDATE listings SET relevance=? WHERE key=?", change)
+        # A document row describes a listing's link (keyed on source_id + url).
+        # Once no listing points at it, it is dead weight -- and the published
+        # mirror's invariant (documents <= listings, repository.verify_projection)
+        # fails, which makes CI refuse to publish.
+        dead_docs = ("SELECT document_id FROM documents d WHERE NOT EXISTS ("
+                     "SELECT 1 FROM listings l WHERE l.source_id = d.source_id AND l.url = d.url)")
+        conn.execute(f"DELETE FROM document_versions WHERE document_id IN ({dead_docs})")
+        conn.execute(f"DELETE FROM documents WHERE document_id IN ({dead_docs})")
+        conn.commit()
+        return len(drop), len(change)
     finally:
         conn.close()
 
@@ -953,9 +1064,9 @@ def run(verbose=True):
             if verbose:
                 print(f"  ✓ {src['name']:<42} (+{new} new)")
     last_run_ok_sources = ok
-    rescored = rescore_stored()
-    if rescored:
-        log.info("re-scored %d stored keyword-only listing(s) high -> medium", rescored)
+    dropped, rescored = cleanup_stored()
+    if dropped or rescored:
+        log.info("cleanup: %d stored listing(s) removed, %d re-scored", dropped, rescored)
     pruned = db.prune_stale()
     # Keep the opportunity-first projection in step with the listing store.
     # Without this the mirror drifts (new listings never reach

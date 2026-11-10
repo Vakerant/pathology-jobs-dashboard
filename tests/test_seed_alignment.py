@@ -45,9 +45,10 @@ def test_seed_ids_are_unique():
     assert not dupes, f"duplicate seed source_id(s): {sorted(dupes)}"
 
 
-def test_seeds_are_not_empty():
-    # Guards against a botched edit silently emptying the seed set.
-    assert len(seed_module.SEEDS) >= 15, f"only {len(seed_module.SEEDS)} seeds left"
+def test_no_placeholder_seeds():
+    # Seeds were hand-written summaries that looked like live vacancies and
+    # never closed. Every listing must come from a scraped notice.
+    assert seed_module.SEEDS == []
 
 
 def test_every_seed_has_the_required_fields():

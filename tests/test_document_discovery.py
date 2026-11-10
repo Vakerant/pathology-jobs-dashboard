@@ -206,7 +206,7 @@ def test_collect_survives_a_failing_index_page():
 
     items = scraper._collect(HOMEPAGE_HTML, base, sess)
     # The homepage's own candidates are still returned.
-    assert any(i["url"].endswith("/residents-rec.php") for i in items)
+    assert any(i["url"].endswith("/residents-rec-walkin.php") for i in items)
     assert index in sess.requested
 
 
@@ -238,8 +238,10 @@ def test_mentions_pathology_ignores_the_negative_gate():
 @pytest.mark.parametrize("text,expected", [
     ("MD/DNB in Pathology", True),
     ("Pathology & Lab Medicine", True),
-    ("Department of Transfusion Medicine", True),
-    ("Blood Bank Technician", True),
+    # Transfusion medicine / blood bank are a separate MD (IHTM): not pathology.
+    ("Department of Transfusion Medicine", False),
+    ("Blood Bank Technician", False),
+    ("Department of Histopathology", True),
     ("Department of Medicine", False),
     ("Senior Resident in Anaesthesia", False),
     ("", False),
@@ -391,11 +393,21 @@ def test_enrich_never_demotes_an_already_high_item(monkeypatch):
     assert item["rel"] == "high"
 
 
-def test_enrich_leaves_non_pathology_documents_untouched(monkeypatch):
-    _stub_pdf_text(monkeypatch, "AIIMS JODHPUR Subject: Department of Medicine. 3 posts.")
+def test_enrich_rejects_a_read_document_without_pathology(monkeypatch):
+    # The body was read and names no pathology seat: the notice is for other
+    # departments, so the candidate is rejected (rel None), not kept as medium.
+    _stub_pdf_text(monkeypatch, "AIIMS JODHPUR Subject: Senior Residents, Department of Medicine. 3 posts.")
     item = {"title": "View Document", "url": "https://x.in/a.pdf", "rel": "medium"}
+    assert scraper._enrich_from_pdf(item, FakeSession({})) is True
+    assert item["rel"] is None
+    assert item["title"] == "View Document"
+
+
+def test_enrich_leaves_an_unreadable_document_untouched(monkeypatch):
+    _stub_pdf_text(monkeypatch, "")
+    item = {"title": "SR Advertisement", "url": "https://x.in/a.pdf", "rel": "medium"}
     assert scraper._enrich_from_pdf(item, FakeSession({})) is False
-    assert item == {"title": "View Document", "url": "https://x.in/a.pdf", "rel": "medium"}
+    assert item == {"title": "SR Advertisement", "url": "https://x.in/a.pdf", "rel": "medium"}
 
 
 def test_enrich_ignores_non_pdf_targets(monkeypatch):
